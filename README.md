@@ -43,7 +43,7 @@ Under **Advanced**:
 
 | | Default | |
 |---|---|---|
-| Ledger address on this server | `http://127.0.0.1:$PORT`, else `:3000` | Where Ledger listens. Loopback addresses only |
+| Ledger address on this server | detected from the port Ledger listens on | A port (`3000`) or address (`127.0.0.1:3000`, `https://localhost:8443`) on this server. Addresses on other machines are refused |
 | HTTPS port | 443 | 443, 8443 or 10000 (the ports Serve allows). Pick another if 443 is taken |
 | tailscaled socket | `/var/run/tailscale/tailscaled.sock` | Change it if your distribution puts it elsewhere |
 

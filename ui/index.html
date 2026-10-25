@@ -186,7 +186,8 @@ const views = {
 		}
 		html += `<details style="margin-top:18px"><summary class="muted">Advanced</summary>
 			<form id="nf" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px;margin-top:10px">
-				<label>Ledger address on this server <input name="serve_target" value="${n.target_is_default ? "" : esc(n.target)}" placeholder="${esc(n.target)}"></label>
+				<label>Ledger address on this server <input name="serve_target" value="${n.target_is_default ? "" : esc(n.target.replace("https+insecure", "https"))}" placeholder="${esc(n.target)}">
+					<span class="muted small">${n.detected_targets?.length ? `Detected: ${esc(n.detected_targets.join(", "))}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000)."}</span></label>
 				<label>HTTPS port <select name="serve_port">${[443, 8443, 10000].map((p) => `<option ${p === n.port ? "selected" : ""}>${p}</option>`).join("")}</select></label>
 				<label>tailscaled socket <input name="socket_path" value="${esc(n.socket_path)}"></label>
 				<div><button>Save</button></div>

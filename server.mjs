@@ -4,13 +4,14 @@
 // (expiring keys, offline machines, pending approvals, client updates) and
 // records the monthly subscription as a balanced journal entry.
 
+import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 
 const API = "https://api.tailscale.com/api/v2";
 const SERVE_PORTS = [443, 8443, 10000]; // the ports Tailscale Serve accepts for HTTPS
 const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
-const TARGET_RE = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})$/;
 const TIMEOUT_MS = 10_000;
 const LINK = "/apps/tailscale";
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
@@ -42,6 +43,93 @@ const strList = (v) => (Array.isArray(v) ? v.map(String) : []);
 const listNames = (names, max = 8) =>
 	names.slice(0, max).join(", ") + (names.length > max ? ` and ${names.length - max} more` : "");
 const shortName = (n) => String(n).split(".")[0];
+
+// /proc/net/tcp{,6} address: little-endian 32-bit words of hex.
+function procAddr(hex) {
+	const bytes = hex.match(/../g).map((b) => parseInt(b, 16));
+	for (let i = 0; i < bytes.length; i += 4) bytes.splice(i, 4, ...bytes.slice(i, i + 4).reverse());
+	if (bytes.length === 4) return bytes.join(".");
+	const groups = [];
+	for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+	const v6 = groups.join(":");
+	if (/^0:0:0:0:0:ffff:/.test(v6)) return bytes.slice(12).join("."); // IPv4-mapped
+	return v6 === "0:0:0:0:0:0:0:0" ? "::" : v6 === "0:0:0:0:0:0:0:1" ? "::1" : v6;
+}
+
+// TCP ports this very process (Ledger) listens on, read from /proc. [] where unavailable.
+function ownListeners() {
+	try {
+		const inodes = new Set();
+		for (const fd of fs.readdirSync("/proc/self/fd")) {
+			try {
+				const m = /^socket:\[(\d+)\]$/.exec(fs.readlinkSync(`/proc/self/fd/${fd}`));
+				if (m) inodes.add(m[1]);
+			} catch {}
+		}
+		const out = [];
+		for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+			let text;
+			try {
+				text = fs.readFileSync(file, "utf8");
+			} catch {
+				continue;
+			}
+			for (const line of text.trim().split("\n").slice(1)) {
+				const c = line.trim().split(/\s+/);
+				if (c[3] !== "0A" || !inodes.has(c[9])) continue; // 0A = LISTEN
+				const [ip, port] = c[1].split(":");
+				out.push({ ip: procAddr(ip), port: parseInt(port, 16) });
+			}
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
+const hostFor = (ip) => (ip === "0.0.0.0" || ip === "::" ? "127.0.0.1" : ip.includes(":") ? `[${ip}]` : ip);
+
+// This machine's own addresses: Ledger may only be published from here.
+function ownAddresses() {
+	const set = new Set(["127.0.0.1", "::1", "localhost"]);
+	for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) set.add(a.address.split("%")[0]);
+	return set;
+}
+
+// Accepts "3000", "127.0.0.1:3000", "http://10.0.0.5:3000/", "https://localhost:8443", ...
+// Returns a Tailscale Serve proxy target, or null if it isn't an address on this machine.
+function normalizeTarget(input) {
+	let v = String(input).trim();
+	if (/^\d{1,5}$/.test(v)) v = `127.0.0.1:${v}`;
+	if (!/^[a-z]+:\/\//i.test(v)) v = `http://${v}`;
+	let u;
+	try {
+		u = new URL(v);
+	} catch {
+		return null;
+	}
+	if (!["http:", "https:"].includes(u.protocol) || u.username || u.password || u.search || u.hash) return null;
+	if (u.pathname !== "/" && u.pathname !== "") return null;
+	const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+	let host = u.hostname.replace(/^\[|\]$/g, "");
+	if (host === "0.0.0.0" || host === "::") host = "127.0.0.1";
+	if (!ownAddresses().has(host) || port < 1 || port > 65535) return null;
+	const h = host.includes(":") ? `[${host}]` : host;
+	// Serve can't verify a local certificate, so HTTPS targets skip verification.
+	return `${u.protocol === "https:" ? "https+insecure" : "http"}://${h}:${port}`;
+}
+
+// Can we open a TCP connection to a Serve target?
+function probe(target) {
+	const m = /^[a-z+]+:\/\/\[?([^\]]+?)\]?:(\d+)$/.exec(target);
+	return new Promise((resolve) => {
+		if (!m) return resolve(false);
+		const sock = net.connect({ host: m[1], port: Number(m[2]) });
+		sock.setTimeout(3_000, () => (sock.destroy(), resolve(false)));
+		sock.once("connect", () => (sock.end(), resolve(true)));
+		sock.once("error", () => resolve(false));
+	});
+}
 
 /** @param {any} ctx */
 export default async function register(ctx) {
@@ -518,7 +606,11 @@ export default async function register(ctx) {
 	try {
 		processUser = os.userInfo().username;
 	} catch {}
-	const defaultTarget = `http://127.0.0.1:${/^\d{1,5}$/.test(process.env.PORT ?? "") ? process.env.PORT : 3000}`;
+	// Default: the port Ledger itself is listening on.
+	const listeners = ownListeners();
+	const detectedTargets = [...new Set(listeners.map((l) => `http://${hostFor(l.ip)}:${l.port}`))];
+	const defaultTarget = detectedTargets[0]
+		?? `http://127.0.0.1:${/^\d{1,5}$/.test(process.env.PORT ?? "") ? process.env.PORT : 3000}`;
 	const targetOf = (s) => s.serve_target ?? defaultTarget;
 	const operatorHint = () => `run  sudo tailscale set --operator=${processUser}  on the Ledger server`;
 
@@ -600,6 +692,7 @@ export default async function register(ctx) {
 		const target = targetOf(s);
 		const base = {
 			socket_path: s.socket_path, process_user: processUser, target, target_is_default: !s.serve_target,
+			detected_targets: detectedTargets,
 			port: s.serve_port, wanted: s.serve_wanted,
 		};
 		let st;
@@ -659,9 +752,12 @@ export default async function register(ctx) {
 		if (typeof socket_path !== "string" || !SOCKET_RE.test(socket_path)) throw bad("Socket path must be an absolute path");
 		let serve_target = b.serve_target === undefined ? cur.serve_target : b.serve_target || null;
 		if (serve_target !== null) {
-			const m = typeof serve_target === "string" && TARGET_RE.exec(serve_target.trim());
-			if (!m || Number(m[2]) < 1 || Number(m[2]) > 65535) throw bad("Ledger address must look like http://127.0.0.1:3000 (this server only)");
-			serve_target = serve_target.trim();
+			const t = typeof serve_target === "string" && serve_target.length <= 100 ? normalizeTarget(serve_target) : null;
+			if (!t) {
+				throw bad(`"${String(serve_target).slice(0, 100)}" isn't an address on this server. ` +
+					`Enter the port or address Ledger listens on, e.g. ${defaultTarget}`);
+			}
+			serve_target = t === defaultTarget ? null : t;
 		}
 		const serve_port = b.serve_port === undefined ? cur.serve_port : Number(b.serve_port);
 		if (!SERVE_PORTS.includes(serve_port)) throw bad(`HTTPS port must be one of ${SERVE_PORTS.join(", ")}`);
@@ -681,10 +777,8 @@ export default async function register(ctx) {
 		const dns = selfDns(st);
 		if (!dns) throw bad("This machine has no MagicDNS name: turn on MagicDNS in the Tailscale admin console (DNS page)");
 		if (!st.CertDomains?.length) throw bad("Turn on HTTPS Certificates in the Tailscale admin console (DNS page), then try again");
-		try {
-			await fetch(target, { redirect: "manual", signal: AbortSignal.timeout(3_000) });
-		} catch {
-			throw bad(`Nothing answers at ${target}. Set the address Ledger listens on under "Ledger address"`);
+		if (!(await probe(target))) {
+			throw bad(`Nothing answers at ${target.replace("https+insecure", "https")}. Set the address Ledger listens on under Advanced`);
 		}
 
 		const { body, etag } = await localJson(s, "GET", "/serve-config");
