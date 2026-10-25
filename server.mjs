@@ -1,9 +1,16 @@
-// Tailscale module for Ledger: syncs the tailnet's devices and users from the
-// Tailscale API, raises dashboard alerts (expiring keys, offline machines,
-// pending approvals, client updates) and records the monthly subscription as
-// a balanced journal entry.
+// Tailscale module for Ledger: publishes Ledger on the tailnet through the
+// server's own tailscaled (Tailscale Serve, via its LocalAPI socket), syncs the
+// tailnet's devices and users from the Tailscale API, raises dashboard alerts
+// (expiring keys, offline machines, pending approvals, client updates) and
+// records the monthly subscription as a balanced journal entry.
+
+import http from "node:http";
+import os from "node:os";
 
 const API = "https://api.tailscale.com/api/v2";
+const SERVE_PORTS = [443, 8443, 10000]; // the ports Tailscale Serve accepts for HTTPS
+const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
+const TARGET_RE = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})$/;
 const TIMEOUT_MS = 10_000;
 const LINK = "/apps/tailscale";
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
@@ -505,6 +512,218 @@ export default async function register(ctx) {
 		if (!rowCount) throw new ctx.HttpError(409, "Only a charge stuck in 'pending' for over a minute can be discarded");
 	});
 
+	// ---------------------------------------------------------------- tailnet access (local tailscaled)
+
+	let processUser = "the Ledger service user";
+	try {
+		processUser = os.userInfo().username;
+	} catch {}
+	const defaultTarget = `http://127.0.0.1:${/^\d{1,5}$/.test(process.env.PORT ?? "") ? process.env.PORT : 3000}`;
+	const targetOf = (s) => s.serve_target ?? defaultTarget;
+	const operatorHint = () => `run  sudo tailscale set --operator=${processUser}  on the Ledger server`;
+
+	// One request to tailscaled's LocalAPI over its unix socket.
+	function localApi(socketPath, method, path, body, headers = {}) {
+		return new Promise((resolve, reject) => {
+			const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
+			const req = http.request({
+				socketPath, method, path: `/localapi/v0${path}`,
+				headers: {
+					Host: "local-tailscaled.sock",
+					...(data ? { "Content-Type": "application/json", "Content-Length": data.length } : {}),
+					...headers,
+				},
+			}, (res) => {
+				const chunks = [];
+				let size = 0;
+				res.on("data", (c) => {
+					size += c.length;
+					if (size > 4 * 1024 * 1024) req.destroy(new Error("tailscaled response too large"));
+					else chunks.push(c);
+				});
+				res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString("utf8") }));
+				res.on("error", reject);
+			});
+			req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("tailscaled did not answer within 10 s")));
+			req.on("error", (e) => {
+				if (e.code === "ENOENT" || e.code === "ECONNREFUSED") {
+					reject(bad(`Tailscale isn't running on the Ledger server (no tailscaled at ${socketPath}). Install Tailscale there and run  sudo tailscale up`));
+				} else if (e.code === "EACCES") {
+					reject(bad(`Ledger may not use ${socketPath}: ${operatorHint()}`));
+				} else reject(e);
+			});
+			if (data) req.write(data);
+			req.end();
+		});
+	}
+
+	async function localJson(s, method, path, body, headers) {
+		const r = await localApi(s.socket_path, method, path, body, headers);
+		if (r.status === 403) throw bad(`tailscaled refused (${r.text.trim().slice(0, 150) || "access denied"}): ${operatorHint()}`);
+		if (r.status === 412) throw new ctx.HttpError(409, "The Serve configuration changed meanwhile; try again");
+		if (r.status < 200 || r.status > 299) {
+			let msg = r.text.trim();
+			try {
+				msg = JSON.parse(msg).error ?? msg;
+			} catch {}
+			throw new Error(`tailscaled ${path.split("?")[0]}: ${String(msg).slice(0, 200) || `HTTP ${r.status}`}`);
+		}
+		return { body: r.text.trim() && r.text.trim() !== "null" ? JSON.parse(r.text) : null, etag: r.headers.etag };
+	}
+
+	const nodeStatus = async (s) => (await localJson(s, "GET", "/status?peers=false")).body;
+	const selfDns = (st) => String(st?.Self?.DNSName ?? "").replace(/\.$/, "");
+	const serveUrl = (dns, port) => `https://${dns}${port === 443 ? "" : `:${port}`}/`;
+
+	// Remove every "/" handler that proxies to `target`, then drop emptied entries.
+	function withoutOurs(cfg, target) {
+		const web = { ...cfg.Web };
+		for (const [hp, w] of Object.entries(web)) {
+			if (w?.Handlers?.["/"]?.Proxy !== target) continue;
+			const { "/": _, ...rest } = w.Handlers;
+			if (Object.keys(rest).length) web[hp] = { ...w, Handlers: rest };
+			else delete web[hp];
+		}
+		const usedPorts = new Set(Object.keys(web).map((hp) => hp.slice(hp.lastIndexOf(":") + 1)));
+		const tcp = Object.fromEntries(Object.entries(cfg.TCP ?? {}).filter(([p, v]) => !v?.HTTPS || usedPorts.has(p)));
+		const funnel = Object.fromEntries(Object.entries(cfg.AllowFunnel ?? {}).filter(([hp]) => hp in web));
+		return { ...cfg, Web: web, TCP: tcp, AllowFunnel: funnel };
+	}
+
+	async function nodeInfo(s) {
+		const target = targetOf(s);
+		const base = {
+			socket_path: s.socket_path, process_user: processUser, target, target_is_default: !s.serve_target,
+			port: s.serve_port, wanted: s.serve_wanted,
+		};
+		let st;
+		try {
+			st = await nodeStatus(s);
+		} catch (e) {
+			return { ...base, reachable: false, error: e.message };
+		}
+		const dns = selfDns(st);
+		const info = {
+			...base, reachable: true,
+			backend_state: st.BackendState ?? null,
+			auth_url: st.AuthURL || null,
+			version: st.Version ?? null,
+			tailnet: st.CurrentTailnet?.Name ?? null,
+			magic_dns: st.CurrentTailnet?.MagicDNSEnabled ?? null,
+			https_enabled: Array.isArray(st.CertDomains) && st.CertDomains.length > 0,
+			self: st.Self ? { host_name: st.Self.HostName, dns_name: dns, ips: st.Self.TailscaleIPs ?? [], id: st.Self.ID } : null,
+			serving: false, url: null, conflict: null, funnel: false,
+		};
+		if (info.backend_state !== "Running" || !dns) return info;
+		try {
+			const cfg = (await localJson(s, "GET", "/serve-config")).body ?? {};
+			const hp = `${dns}:${s.serve_port}`;
+			const h = cfg.Web?.[hp]?.Handlers?.["/"];
+			info.serving = h?.Proxy === target;
+			info.url = info.serving ? serveUrl(dns, s.serve_port) : null;
+			info.funnel = info.serving && !!cfg.AllowFunnel?.[hp];
+			if (h && !info.serving) info.conflict = `${serveUrl(dns, s.serve_port)} already serves ${h.Proxy ?? h.Path ?? "something else"}`;
+			else if (cfg.TCP?.[s.serve_port] && !cfg.TCP[s.serve_port].HTTPS) info.conflict = `Port ${s.serve_port} is used for TCP forwarding`;
+		} catch (e) {
+			info.serve_error = e.message; // reading the Serve config can need operator rights
+		}
+		return info;
+	}
+
+	// Alert on the dashboard when Ledger was published but no longer is.
+	async function checkServe() {
+		const s = await getSettings();
+		if (!s.serve_wanted) return safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		const n = await nodeInfo(s);
+		if (n.serving) return safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		const why = !n.reachable ? n.error
+			: n.backend_state !== "Running" ? `Tailscale on the server is ${n.backend_state}.`
+			: n.serve_error ?? n.conflict ?? "The Tailscale Serve entry for Ledger was removed.";
+		await safe(() => ctx.dashboard.notify({
+			key: "tailnet-access", title: "Ledger isn't reachable on your tailnet", body: why, level: "warning", link: LINK,
+		}));
+	}
+
+	ctx.route("GET", "/node", async () => nodeInfo(await getSettings()));
+
+	ctx.route("PUT", "/node/settings", async (req) => {
+		const b = req.body ?? {};
+		const cur = await getSettings();
+		const socket_path = b.socket_path === undefined ? cur.socket_path : b.socket_path;
+		if (typeof socket_path !== "string" || !SOCKET_RE.test(socket_path)) throw bad("Socket path must be an absolute path");
+		let serve_target = b.serve_target === undefined ? cur.serve_target : b.serve_target || null;
+		if (serve_target !== null) {
+			const m = typeof serve_target === "string" && TARGET_RE.exec(serve_target.trim());
+			if (!m || Number(m[2]) < 1 || Number(m[2]) > 65535) throw bad("Ledger address must look like http://127.0.0.1:3000 (this server only)");
+			serve_target = serve_target.trim();
+		}
+		const serve_port = b.serve_port === undefined ? cur.serve_port : Number(b.serve_port);
+		if (!SERVE_PORTS.includes(serve_port)) throw bad(`HTTPS port must be one of ${SERVE_PORTS.join(", ")}`);
+		const changesServe = targetOf(cur) !== (serve_target ?? defaultTarget) || serve_port !== cur.serve_port;
+		if (changesServe && (await nodeInfo(cur)).serving) throw new ctx.HttpError(409, "Stop sharing Ledger on the tailnet before changing its address or port");
+		await ctx.db.query(
+			`UPDATE ${S}.settings SET socket_path = $1, serve_target = $2, serve_port = $3, updated_by = $4, updated_at = now() WHERE id`,
+			[socket_path, serve_target, serve_port, req.user.username]);
+		return nodeInfo(await getSettings());
+	});
+
+	ctx.route("POST", "/node/serve", async (req) => {
+		const s = await getSettings();
+		const target = targetOf(s);
+		const st = await nodeStatus(s);
+		if (st.BackendState !== "Running") throw bad(`Tailscale on the Ledger server is not connected (${st.BackendState}). Log it in first`);
+		const dns = selfDns(st);
+		if (!dns) throw bad("This machine has no MagicDNS name: turn on MagicDNS in the Tailscale admin console (DNS page)");
+		if (!st.CertDomains?.length) throw bad("Turn on HTTPS Certificates in the Tailscale admin console (DNS page), then try again");
+		try {
+			await fetch(target, { redirect: "manual", signal: AbortSignal.timeout(3_000) });
+		} catch {
+			throw bad(`Nothing answers at ${target}. Set the address Ledger listens on under "Ledger address"`);
+		}
+
+		const { body, etag } = await localJson(s, "GET", "/serve-config");
+		const cfg = body ?? {};
+		const hp = `${dns}:${s.serve_port}`;
+		const existing = cfg.Web?.[hp]?.Handlers?.["/"];
+		if (existing && existing.Proxy !== target) {
+			throw new ctx.HttpError(409, `${serveUrl(dns, s.serve_port)} already serves ${existing.Proxy ?? existing.Path ?? "something else"}. Pick another HTTPS port`);
+		}
+		const tcp = cfg.TCP?.[s.serve_port];
+		if (tcp && !tcp.HTTPS) throw new ctx.HttpError(409, `Port ${s.serve_port} is used for TCP forwarding. Pick another HTTPS port`);
+		const next = {
+			...cfg,
+			TCP: { ...cfg.TCP, [s.serve_port]: { ...tcp, HTTPS: true } },
+			Web: { ...cfg.Web, [hp]: { ...cfg.Web?.[hp], Handlers: { ...cfg.Web?.[hp]?.Handlers, "/": { Proxy: target } } } },
+		};
+		await localJson(s, "POST", "/serve-config", next, etag ? { "If-Match": etag } : {});
+		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`);
+		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), target, by: req.user.username });
+		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		return nodeInfo(await getSettings());
+	});
+
+	ctx.route("DELETE", "/node/serve", async (req) => {
+		const s = await getSettings();
+		const { body, etag } = await localJson(s, "GET", "/serve-config");
+		if (body) await localJson(s, "POST", "/serve-config", withoutOurs(body, targetOf(s)), etag ? { "If-Match": etag } : {});
+		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`);
+		ctx.log.info("ledger unpublished from tailnet", { by: req.user.username });
+		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		return nodeInfo(await getSettings());
+	});
+
+	// Start an interactive login and hand back the URL to approve this machine.
+	ctx.route("POST", "/node/login", async () => {
+		const s = await getSettings();
+		await localJson(s, "POST", "/login-interactive");
+		for (let i = 0; i < 20; i++) {
+			const st = await nodeStatus(s);
+			if (st.AuthURL || st.BackendState === "Running") return { auth_url: st.AuthURL || null, backend_state: st.BackendState };
+			await new Promise((r) => setTimeout(r, 500));
+		}
+		throw new ctx.HttpError(504, "tailscaled did not produce a login link; run  sudo tailscale up  on the server instead");
+	});
+
 	// ---------------------------------------------------------------- background
 
 	async function tick() {
@@ -516,6 +735,7 @@ export default async function register(ctx) {
 			if (due.due) await sync("auto").catch(() => {}); // failure is logged and shown on the dashboard
 		}
 		if (Date.now() - lastBillingCheck > 3_600_000) await checkBilling();
+		if (s.serve_wanted) await checkServe();
 	}
 	const runTick = () => tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));
 	setTimeout(runTick, 5_000).unref();

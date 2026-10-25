@@ -1,7 +1,11 @@
 # Tailscale for Ledger
 
-A Ledger module that connects your Tailscale tailnet to your books.
+A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailnet into your books.
 
+- **Ledger on the tailnet**: one click shares Ledger with your tailnet at
+  `https://<server>.<tailnet>.ts.net` through Tailscale Serve, with a real HTTPS
+  certificate, reachable only from your tailnet devices, never the public internet.
+  A dashboard warning appears if it stops being shared.
 - **Devices and users**: syncs the tailnet's machines and users from the Tailscale API
   (every 60 minutes by default, or with **Sync now**) and lists them with
   online status, OS and client version, Tailscale IP, tags and key expiry.
@@ -15,7 +19,47 @@ A Ledger module that connects your Tailscale tailnet to your books.
   as a journal entry, *seats × price per user + flat fee*, with a dashboard
   to-do each month until it's recorded. Posted charges can be reversed.
 
-## Setup
+## Put Ledger on your tailnet
+
+The module drives the Tailscale daemon on the server Ledger runs on, through its
+local socket (`/var/run/tailscale/tailscaled.sock`). One-time setup on that server:
+
+```sh
+curl -fsSL https://tailscale.com/install.sh | sh   # install Tailscale
+sudo tailscale up                                  # join your tailnet
+sudo tailscale set --operator=ledger               # let Ledger's service user manage Serve
+```
+
+Replace `ledger` with the user Ledger runs as. The **Access** tab shows the exact command.
+Without `--operator`, Ledger can show the server's status but can't share it.
+
+In the Tailscale admin console → **DNS**, turn on **MagicDNS** and **HTTPS Certificates**.
+
+Then open **Tailscale → Access** in Ledger and click **Share Ledger on the tailnet**.
+That's the same as running `tailscale serve --bg <ledger port>` on the server.
+Other Serve entries on the machine are left alone. **Stop sharing** removes only Ledger's.
+
+Under **Advanced**:
+
+| | Default | |
+|---|---|---|
+| Ledger address on this server | `http://127.0.0.1:$PORT`, else `:3000` | Where Ledger listens. Loopback addresses only |
+| HTTPS port | 443 | 443, 8443 or 10000 (the ports Serve allows). Pick another if 443 is taken |
+| tailscaled socket | `/var/run/tailscale/tailscaled.sock` | Change it if your distribution puts it elsewhere |
+
+Notes:
+- Requests arrive at Ledger with the original `Host` (`<server>.<tailnet>.ts.net`)
+  over HTTPS. If your Ledger is configured with a fixed public URL or allowed hosts,
+  add the tailnet address there.
+- Who can reach it is governed by your tailnet ACLs. Everyone still signs in to Ledger.
+- The module never turns on Funnel (public internet). If Funnel is enabled for
+  Ledger's address by other means, the Access tab warns you.
+- If Ledger runs in a container, mount the host's socket into it
+  (`-v /var/run/tailscale:/var/run/tailscale`) and run Ledger as the operator user.
+
+## Devices, users and billing setup
+
+These use the Tailscale API (separate from the tailnet access above).
 
 1. Install the module: Ledger → Settings → Modules → `mastifdogo/tailscale-module` → Add.
 2. In the Tailscale admin console, create read-only credentials:
@@ -86,6 +130,10 @@ All under `/api/v1/m/tailscale`, logged-in users only:
 
 | | |
 |---|---|
+| `GET /node` | this server's Tailscale state and whether Ledger is shared |
+| `POST /node/serve`, `DELETE /node/serve` | share / stop sharing Ledger on the tailnet |
+| `PUT /node/settings` | `{serve_target?, serve_port?, socket_path?}` |
+| `POST /node/login` | start an interactive login; returns `{auth_url}` |
 | `GET /status` | connection state, counts, last sync, this month's charge |
 | `POST /sync` | sync now |
 | `GET /devices`, `GET /users`, `GET /syncs` | snapshots and the last 20 syncs |
@@ -99,7 +147,7 @@ All under `/api/v1/m/tailscale`, logged-in users only:
 
 1. Bump `version` in `ledger-module.json` (and add a new `migrations/NNN_*.sql`
    for schema changes, never edit `001_init.sql`).
-2. `git tag v1.0.0 && git push origin v1.0.0`
+2. `git tag v0.1.0 && git push origin v0.1.0`
 3. Create a GitHub Release from the tag (not a draft or pre-release).
    Ledger picks it up on its update schedule or with **Update modules now**.
 

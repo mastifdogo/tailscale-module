@@ -56,6 +56,9 @@
 	.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 	.toolbar input { flex: 1 1 160px; width: auto; }
 	.preview { font-size: 17px; margin: 10px 0; }
+	pre { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
+	.big { font-size: 17px; word-break: break-all; }
+	.steps { padding-left: 20px; } .steps li { margin: 4px 0; }
 	@media (max-width: 560px) { .opt { display: none; } main { padding: 12px; } }
 </style>
 </head>
@@ -68,6 +71,7 @@
 	</header>
 	<div id="msg" hidden></div>
 	<nav role="tablist" id="tabs">
+		<button role="tab" data-tab="access">Access</button>
 		<button role="tab" data-tab="overview">Overview</button>
 		<button role="tab" data-tab="devices">Devices</button>
 		<button role="tab" data-tab="users">Users</button>
@@ -107,8 +111,8 @@ function toCents(s) {
 }
 const centsToInput = (c) => (Number(c) / 100).toFixed(2);
 
-let state = { status: null, tab: "overview", filter: "" };
-try { state.tab = localStorage.getItem("tailscale.tab") || "overview"; } catch {}
+let state = { status: null, tab: "access", filter: "" };
+try { state.tab = localStorage.getItem("tailscale.tab") || "access"; } catch {}
 
 function flash(text, kind = "danger") {
 	const m = $("#msg");
@@ -122,7 +126,7 @@ async function loadStatus() {
 	state.status = await api("/status");
 	const st = state.status;
 	const ls = st.last_sync;
-	$("#synced").innerHTML = !st.configured ? "Not connected"
+	$("#synced").innerHTML = !st.configured ? "No API credentials"
 		: !ls ? "Never synced"
 		: ls.ok === false ? `<span class="danger">Last sync failed ${esc(ago(ls.started_at))}</span>`
 		: ls.ok ? `Synced ${esc(ago(ls.finished_at))}` : "Syncing…";
@@ -130,10 +134,86 @@ async function loadStatus() {
 }
 
 const views = {
+	async access(el) {
+		const n = await api("/node");
+		const cmd = (c) => `<pre>${esc(c)}</pre>`;
+		let html = `<h2 style="margin-top:0">Ledger on your tailnet</h2>`;
+		if (!n.reachable) {
+			html += `<div class="msg warn"><span>${esc(n.error)}</span></div>
+				<p>To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:</p>
+				<ol class="steps">
+					<li>Install Tailscale: ${cmd("curl -fsSL https://tailscale.com/install.sh | sh")}</li>
+					<li>Join your tailnet: ${cmd("sudo tailscale up")}</li>
+					<li>Let Ledger manage Tailscale Serve: ${cmd(`sudo tailscale set --operator=${n.process_user}`)}</li>
+				</ol>
+				<button id="recheck">Check again</button>`;
+		} else if (n.backend_state !== "Running") {
+			html += `<p>Tailscale is installed on the Ledger server but not connected (<b>${esc(n.backend_state)}</b>).</p>
+				${n.auth_url ? `<p><a class="big" href="${esc(n.auth_url)}" target="_blank" rel="noopener">Approve this server in Tailscale ↗</a></p>` : ""}
+				<div class="row"><button class="primary" id="login">Log this server in</button><button id="recheck">Check again</button></div>
+				<p class="muted small">Or on the server: <code>sudo tailscale up</code></p>`;
+		} else {
+			const self = n.self || {};
+			html += `<p>This server is <b>${esc(self.host_name)}</b> on tailnet <b>${esc(n.tailnet)}</b> <span class="muted">(${esc((self.ips || []).join(", "))})</span>.</p>`;
+			if (n.serving) {
+				html += `<div class="msg ok"><span>Ledger is shared with your tailnet at<br><a class="big" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.url)}</a></span></div>
+					${n.funnel ? `<div class="msg danger"><span>Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with <code>tailscale funnel reset</code> unless that's intended.</span></div>` : ""}
+					<p class="muted small">Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual.</p>
+					<button id="unserve">Stop sharing</button>`;
+			} else {
+				const problems = [
+					n.magic_dns === false && "Turn on MagicDNS in the Tailscale admin console (DNS page).",
+					!n.https_enabled && "Turn on HTTPS Certificates in the Tailscale admin console (DNS page).",
+					n.conflict && `${n.conflict}. Choose another HTTPS port below.`,
+					n.serve_error && n.serve_error,
+				].filter(Boolean);
+				html += `${n.wanted ? `<div class="msg warn"><span>Ledger was shared on the tailnet but isn't any more.</span></div>` : ""}
+					${problems.map((p) => `<div class="msg warn"><span>${esc(p)}</span></div>`).join("")}
+					<p>Share Ledger with your tailnet over HTTPS at
+					<b>https://${esc(self.dns_name)}${n.port === 443 ? "" : ":" + n.port}/</b> (Tailscale Serve). It is not exposed to the internet.</p>
+					<button class="primary" id="serve">Share Ledger on the tailnet</button>`;
+			}
+		}
+		html += `<details style="margin-top:18px"><summary class="muted">Advanced</summary>
+			<form id="nf" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px;margin-top:10px">
+				<label>Ledger address on this server <input name="serve_target" value="${n.target_is_default ? "" : esc(n.target)}" placeholder="${esc(n.target)}"></label>
+				<label>HTTPS port <select name="serve_port">${[443, 8443, 10000].map((p) => `<option ${p === n.port ? "selected" : ""}>${p}</option>`).join("")}</select></label>
+				<label>tailscaled socket <input name="socket_path" value="${esc(n.socket_path)}"></label>
+				<div><button>Save</button></div>
+			</form>
+			<p class="muted small">Ledger runs as <code>${esc(n.process_user)}</code>${n.version ? ` · Tailscale ${esc(n.version.split("-")[0])}` : ""}.</p></details>`;
+		el.innerHTML = html;
+
+		const act = (id, fn, okMsg) => $(id)?.addEventListener("click", async (e) => {
+			e.target.disabled = true;
+			try { const r = await fn(); if (okMsg) flash(okMsg(r), "ok"); await show("access"); }
+			catch (err) { flash(err.message); e.target.disabled = false; }
+		});
+		act("#recheck", async () => flash(""));
+		act("#serve", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`);
+		act("#unserve", async () => {
+			if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) throw new Error("Cancelled.");
+			return api("/node/serve", { method: "DELETE" });
+		}, () => "Ledger is no longer shared on the tailnet.");
+		act("#login", async () => {
+			const r = await api("/node/login", { method: "POST", body: "{}" });
+			if (r.auth_url) window.open(r.auth_url, "_blank", "noopener");
+		});
+		$("#nf").onsubmit = async (e) => {
+			e.preventDefault();
+			const f = e.target;
+			try {
+				await api("/node/settings", { method: "PUT", body: JSON.stringify({
+					serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value), socket_path: f.socket_path.value.trim() }) });
+				flash("Saved.", "ok"); await show("access");
+			} catch (err) { flash(err.message); }
+		};
+	},
+
 	async overview(el) {
 		const st = state.status, c = st.counts;
 		if (!st.configured) {
-			el.innerHTML = `<p>Connect your tailnet to get started.</p><button class="primary" id="goSettings">Open settings</button>`;
+			el.innerHTML = `<p>Add Tailscale API credentials to see your tailnet's devices and users here.</p><button class="primary" id="goSettings">Open settings</button>`;
 			$("#goSettings").onclick = () => show("settings");
 			return;
 		}
@@ -366,7 +446,7 @@ const views = {
 };
 
 async function show(tab) {
-	state.tab = views[tab] ? tab : "overview";
+	state.tab = views[tab] ? tab : "access";
 	try { localStorage.setItem("tailscale.tab", state.tab); } catch {}
 	document.querySelectorAll("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === state.tab)));
 	const el = $("#view");
