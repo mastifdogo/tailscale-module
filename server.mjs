@@ -561,6 +561,12 @@ export default async function register(ctx) {
 		const r = await localApi(s.socket_path, method, path, body, headers);
 		if (r.status === 403) throw bad(`tailscaled refused (${r.text.trim().slice(0, 150) || "access denied"}): ${operatorHint()}`);
 		if (r.status === 412) throw new ctx.HttpError(409, "The Serve configuration changed meanwhile; try again");
+		if (r.status === 503) {
+			const err = bad(`Tailscale is running on the Ledger server but not ready (${r.text.trim().slice(0, 100) || "no backend"}). ` +
+				"See  sudo journalctl -u tailscaled  — in an LXC container or restricted VM, run tailscaled with --tun=userspace-networking");
+			err.notReady = true;
+			throw err;
+		}
 		if (r.status < 200 || r.status > 299) {
 			let msg = r.text.trim();
 			try {
@@ -600,7 +606,7 @@ export default async function register(ctx) {
 		try {
 			st = await nodeStatus(s);
 		} catch (e) {
-			return { ...base, reachable: false, error: e.message };
+			return { ...base, reachable: false, not_ready: !!e.notReady, error: e.message };
 		}
 		const dns = selfDns(st);
 		const info = {

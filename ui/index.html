@@ -138,7 +138,17 @@ const views = {
 		const n = await api("/node");
 		const cmd = (c) => `<pre>${esc(c)}</pre>`;
 		let html = `<h2 style="margin-top:0">Ledger on your tailnet</h2>`;
-		if (!n.reachable) {
+		if (!n.reachable && n.not_ready) {
+			html += `<div class="msg warn"><span>Tailscale is installed and running on the Ledger server, but its service hasn't started properly.</span></div>
+				<ol class="steps">
+					<li>If it was just installed or restarted, wait a few seconds and check again.</li>
+					<li>Look at its log for the cause: ${cmd("sudo journalctl -u tailscaled -n 50 --no-pager")}</li>
+					<li>If the log mentions <code>/dev/net/tun</code> (common in LXC containers), run it in userspace mode, which Tailscale Serve supports:
+						${cmd(`echo 'FLAGS="--tun=userspace-networking"' | sudo tee -a /etc/default/tailscaled\nsudo systemctl restart tailscaled\nsudo tailscale up`)}</li>
+				</ol>
+				<p class="muted small">${esc(n.error)}</p>
+				<button id="recheck">Check again</button>`;
+		} else if (!n.reachable) {
 			html += `<div class="msg warn"><span>${esc(n.error)}</span></div>
 				<p>To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:</p>
 				<ol class="steps">
