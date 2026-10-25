@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tailscale</title>
+<style>
+	:root {
+		--bg: #fff; --bg2: #f6f8fa; --text: #1f2328; --muted: #656d76; --border: #dde1e6; --accent: #1f6feb;
+		--ok: #1a7f37; --warn: #9a6700; --danger: #cf222e; --radius: 6px;
+		color-scheme: light dark;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root { --bg: #171b21; --bg2: #1d232b; --text: #e3e7ec; --muted: #97a1ad; --border: #2c333c; --accent: #4c8dff;
+			--ok: #3fb950; --warn: #d29922; --danger: #f85149; }
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+	main { padding: 16px; max-width: 1100px; }
+	header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
+	h1 { font-size: 20px; margin: 0; flex: 1 1 auto; }
+	h2 { font-size: 16px; margin: 20px 0 8px; }
+	.muted { color: var(--muted); }
+	.small { font-size: 13px; }
+	button, input, select { font: inherit; color: inherit; }
+	button { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 12px; cursor: pointer; }
+	button:hover { border-color: var(--accent); }
+	button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+	button:disabled { opacity: .55; cursor: default; }
+	button.link { border: 0; background: none; padding: 0; color: var(--accent); }
+	input, select { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 8px; width: 100%; min-width: 0; }
+	input[type=checkbox] { width: auto; }
+	input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+	nav { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto; }
+	nav button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; white-space: nowrap; color: var(--muted); }
+	nav button[aria-selected=true] { color: var(--text); border-bottom-color: var(--accent); }
+	.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+	.card { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+	.card b { display: block; font-size: 22px; }
+	.wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+	table { border-collapse: collapse; width: 100%; }
+	th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+	th { font-weight: 600; font-size: 13px; color: var(--muted); background: var(--bg2); white-space: nowrap; }
+	tr:last-child td { border-bottom: 0; }
+	td.num, th.num { text-align: right; white-space: nowrap; }
+	.badge { display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 10px; border: 1px solid currentColor; white-space: nowrap; margin: 1px 2px 1px 0; }
+	.ok { color: var(--ok); } .warn { color: var(--warn); } .danger { color: var(--danger); }
+	.msg { padding: 8px 12px; border-radius: var(--radius); border: 1px solid currentColor; margin-bottom: 12px; }
+	.msg span { color: var(--text); }
+	form.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px 14px; }
+	label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
+	label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 15px; }
+	fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px 14px; margin: 0 0 14px; }
+	legend { padding: 0 6px; font-weight: 600; }
+	.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+	.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+	.toolbar input { flex: 1 1 160px; width: auto; }
+	.preview { font-size: 17px; margin: 10px 0; }
+	@media (max-width: 560px) { .opt { display: none; } main { padding: 12px; } }
+</style>
+</head>
+<body>
+<main>
+	<header>
+		<h1>Tailscale</h1>
+		<span id="synced" class="muted small"></span>
+		<button id="syncBtn">Sync now</button>
+	</header>
+	<div id="msg" hidden></div>
+	<nav role="tablist" id="tabs">
+		<button role="tab" data-tab="overview">Overview</button>
+		<button role="tab" data-tab="devices">Devices</button>
+		<button role="tab" data-tab="users">Users</button>
+		<button role="tab" data-tab="billing">Billing</button>
+		<button role="tab" data-tab="settings">Settings</button>
+	</nav>
+	<section id="view"></section>
+</main>
+<script>
+"use strict";
+const api = (path, opts = {}) =>
+	fetch(`/api/v1/m/tailscale${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } })
+		.then(async (r) => {
+			if (!r.ok) {
+				const e = (await r.json().catch(() => ({}))).error;
+				throw new Error([e?.message || r.statusText, ...(e?.details || []).map((d) => d.message)].join(": "));
+			}
+			return r.status === 204 ? null : r.json();
+		});
+
+const $ = (s, root = document) => root.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const money = (cents, cur) => `${(Number(cents) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`;
+const short = (n) => String(n || "").split(".")[0];
+const fmtDate = (d) => (d ? new Date(d).toLocaleString() : "—");
+function ago(d) {
+	if (!d) return "never";
+	const s = (Date.now() - new Date(d).getTime()) / 1000;
+	const fut = s < 0, a = Math.abs(s);
+	const [n, u] = a < 60 ? [a, "s"] : a < 3600 ? [a / 60, "min"] : a < 86400 ? [a / 3600, "h"] : [a / 86400, "d"];
+	return fut ? `in ${Math.round(n)} ${u}` : `${Math.round(n)} ${u} ago`;
+}
+// "6.00" → 600; null if not a valid amount.
+function toCents(s) {
+	const m = /^\s*(\d{1,9})(?:\.(\d{1,2}))?\s*$/.exec(s);
+	return m ? Number(m[1]) * 100 + Number((m[2] || "0").padEnd(2, "0")) : null;
+}
+const centsToInput = (c) => (Number(c) / 100).toFixed(2);
+
+let state = { status: null, tab: "overview", filter: "" };
+try { state.tab = localStorage.getItem("tailscale.tab") || "overview"; } catch {}
+
+function flash(text, kind = "danger") {
+	const m = $("#msg");
+	if (!text) { m.hidden = true; return; }
+	m.className = `msg ${kind}`;
+	m.innerHTML = `<span>${esc(text)}</span>`;
+	m.hidden = false;
+}
+
+async function loadStatus() {
+	state.status = await api("/status");
+	const st = state.status;
+	const ls = st.last_sync;
+	$("#synced").innerHTML = !st.configured ? "Not connected"
+		: !ls ? "Never synced"
+		: ls.ok === false ? `<span class="danger">Last sync failed ${esc(ago(ls.started_at))}</span>`
+		: ls.ok ? `Synced ${esc(ago(ls.finished_at))}` : "Syncing…";
+	$("#syncBtn").disabled = !st.configured;
+}
+
+const views = {
+	async overview(el) {
+		const st = state.status, c = st.counts;
+		if (!st.configured) {
+			el.innerHTML = `<p>Connect your tailnet to get started.</p><button class="primary" id="goSettings">Open settings</button>`;
+			$("#goSettings").onclick = () => show("settings");
+			return;
+		}
+		const ls = st.last_sync;
+		const devices = await api("/devices");
+		const days = st.settings.key_expiry_warn_days;
+		const soon = devices.filter((d) => d.expires && new Date(d.expires) < Date.now() + days * 864e5)
+			.sort((a, b) => new Date(a.expires) - new Date(b.expires));
+		el.innerHTML = `
+			${ls?.ok === false ? `<div class="msg danger"><span>${esc(ls.error)}</span></div>` : ""}
+			${ls?.warning ? `<div class="msg warn"><span>${esc(ls.warning)}</span></div>` : ""}
+			<div class="cards">
+				<div class="card"><b>${c.devices}</b><span class="muted">devices</span></div>
+				<div class="card"><b class="ok">${c.online}</b><span class="muted">online</span></div>
+				<div class="card"><b class="${c.expiring ? "warn" : ""}">${c.expiring}</b><span class="muted">keys expiring</span></div>
+				<div class="card"><b>${c.updates}</b><span class="muted">updates available</span></div>
+				<div class="card"><b>${c.users}</b><span class="muted">users</span></div>
+				<div class="card"><b>${c.seats}</b><span class="muted">billable seats</span></div>
+			</div>
+			<h2>Keys expiring within ${days} days</h2>
+			${soon.length ? `<div class="wrap"><table><thead><tr><th>Device</th><th class="opt">User</th><th>Expires</th></tr></thead><tbody>
+				${soon.map((d) => `<tr><td>${esc(short(d.name))}</td><td class="opt">${esc(d.user_login)}</td>
+					<td class="${new Date(d.expires) < Date.now() ? "danger" : "warn"}">${esc(ago(d.expires))}</td></tr>`).join("")}
+			</tbody></table></div>` : `<p class="muted">None.</p>`}
+			${st.settings.billing_enabled ? `<h2>Billing ${esc(st.period)}</h2><p>${st.period_charge
+				? `Recorded: ${esc(money(st.period_charge.total_cents, st.period_charge.currency))} (${esc(st.period_charge.status)})`
+				: `<span class="warn">Not recorded yet.</span> <button class="link" id="goBilling">Record it</button>`}</p>` : ""}
+			<p class="muted small"><a href="https://login.tailscale.com/admin/machines" target="_blank" rel="noopener">Open the Tailscale admin console ↗</a></p>`;
+		$("#goBilling")?.addEventListener("click", () => show("billing"));
+	},
+
+	async devices(el) {
+		const devices = await api("/devices");
+		const days = state.status.settings.key_expiry_warn_days;
+		el.innerHTML = `<div class="toolbar"><input id="filter" type="search" placeholder="Filter by name, user, OS, IP, tag" value="${esc(state.filter)}"></div>
+			<div class="wrap"><table><thead><tr><th>Device</th><th class="opt">User</th><th class="opt">OS</th><th class="opt">Address</th><th>Last seen</th><th class="opt">Key expiry</th></tr></thead>
+			<tbody id="rows"></tbody></table></div><p class="muted small" id="count"></p>`;
+		const render = () => {
+			const f = state.filter.toLowerCase();
+			const list = devices.filter((d) => !f || [d.name, d.hostname, d.user_login, d.os, d.client_version, ...d.addresses, ...d.tags]
+				.some((v) => String(v || "").toLowerCase().includes(f)));
+			$("#rows").innerHTML = list.map((d) => {
+				const exp = d.expires ? new Date(d.expires) : null;
+				const expCls = exp && exp < Date.now() ? "danger" : exp && exp < Date.now() + days * 864e5 ? "warn" : "";
+				return `<tr>
+					<td>${esc(short(d.name))}
+						${!d.authorized ? `<span class="badge warn">needs approval</span>` : ""}
+						${d.is_external ? `<span class="badge">shared in</span>` : ""}
+						${d.update_available ? `<span class="badge">update</span>` : ""}
+						${d.tags.map((t) => `<span class="badge muted">${esc(t)}</span>`).join("")}</td>
+					<td class="opt">${esc(d.user_login)}</td>
+					<td class="opt">${esc(d.os)} <span class="muted small">${esc((d.client_version || "").split("-")[0])}</span></td>
+					<td class="opt">${esc(d.addresses[0] || "")}</td>
+					<td>${d.connected ? `<span class="ok">● online</span>` : esc(ago(d.last_seen))}</td>
+					<td class="opt ${expCls}">${d.key_expiry_disabled ? `<span class="muted">disabled</span>` : exp ? esc(ago(d.expires)) : "—"}</td>
+				</tr>`;
+			}).join("") || `<tr><td colspan="6" class="muted">No devices.</td></tr>`;
+			$("#count").textContent = `${list.length} of ${devices.length} devices`;
+		};
+		$("#filter").oninput = (e) => { state.filter = e.target.value; render(); };
+		render();
+	},
+
+	async users(el) {
+		const users = await api("/users");
+		const cls = { active: "ok", idle: "muted", suspended: "danger", "needs-approval": "warn" };
+		el.innerHTML = users.length ? `<div class="wrap"><table><thead><tr><th>User</th><th class="opt">Role</th><th>Status</th><th class="num">Devices</th><th class="opt">Last seen</th></tr></thead><tbody>
+			${users.map((u) => `<tr>
+				<td>${esc(u.display_name || u.login_name)}<div class="muted small">${esc(u.login_name)}</div></td>
+				<td class="opt">${esc(u.role)}${u.type === "shared" ? ` <span class="badge">shared</span>` : ""}</td>
+				<td><span class="badge ${cls[u.status] || ""}">${esc(u.status)}</span>${u.type === "member" && u.status === "active" ? ` <span class="badge muted">billable</span>` : ""}</td>
+				<td class="num">${esc(u.device_count ?? "")}</td>
+				<td class="opt">${u.connected ? `<span class="ok">● online</span>` : esc(ago(u.last_seen))}</td>
+			</tr>`).join("")}
+		</tbody></table></div>
+		<p class="muted small">Billable seats = members with status "active". Shared-in users and idle or suspended members are not counted.</p>`
+			: `<p class="muted">No users synced. ${esc(state.status.last_sync?.warning || "")}</p>`;
+	},
+
+	async billing(el) {
+		const st = state.status, s = st.settings;
+		const charges = await api("/charges");
+		const history = `<h2>History</h2>${charges.length ? `<div class="wrap"><table><thead><tr><th>Month</th><th class="num opt">Seats</th><th class="num">Total</th><th>Status</th><th class="opt">Entry</th><th></th></tr></thead><tbody>
+			${charges.map((c) => `<tr>
+				<td>${esc(c.period)}<div class="muted small">${esc(c.entry_date)}</div></td>
+				<td class="num opt">${esc(c.seats)}</td>
+				<td class="num">${esc(money(c.total_cents, c.currency))}</td>
+				<td><span class="badge ${c.status === "posted" ? "ok" : c.status === "reversed" ? "muted" : "warn"}">${esc(c.status)}</span></td>
+				<td class="opt">${c.entry_id ? `#${esc(c.entry_id)}` : ""}${c.reversal_entry_id ? ` → #${esc(c.reversal_entry_id)}` : ""}</td>
+				<td>${c.status === "posted" ? `<button class="link" data-reverse="${esc(c.id)}">Reverse</button>`
+					: c.status === "pending" ? `<button class="link" data-discard="${esc(c.id)}">Discard</button>` : ""}</td>
+			</tr>`).join("")}</tbody></table></div>` : `<p class="muted">No charges recorded yet.</p>`}`;
+
+		if (!s.billing_enabled) {
+			el.innerHTML = `<p>Billing is off. Turn it on under <button class="link" id="goSettings">Settings</button> to record the monthly
+				Tailscale subscription as a journal entry.</p>${history}`;
+			$("#goSettings").onclick = () => show("settings");
+		} else {
+			el.innerHTML = `<form id="chargeForm">
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px 14px">
+					<label>Month <input name="period" type="month" required value="${esc(st.period)}"></label>
+					<label>Entry date <input name="entry_date" type="date" required value="${esc(st.today)}"></label>
+					<label>Seats <input name="seats" type="number" min="0" max="100000" step="1" required value="${esc(st.counts.seats)}"></label>
+					<label>Memo (optional) <input name="memo" maxlength="200"></label>
+				</div>
+				<p class="preview" id="preview"></p>
+				<p class="muted small">Debit ${esc(s.expense_account)} · Credit ${esc(s.payment_account)} · reference tailscale:&lt;month&gt;</p>
+				<button class="primary" id="postBtn">Post charge</button>
+			</form>${history}`;
+			const f = $("#chargeForm");
+			const preview = () => {
+				const seats = Math.max(0, Math.trunc(Number(f.seats.value) || 0));
+				const total = seats * Number(s.price_per_user_cents) + Number(s.base_fee_cents);
+				$("#preview").innerHTML = `${seats} × ${esc(money(s.price_per_user_cents, s.currency))}${Number(s.base_fee_cents)
+					? ` + ${esc(money(s.base_fee_cents, s.currency))}` : ""} = <b>${esc(money(total, s.currency))}</b>`;
+			};
+			f.seats.oninput = preview;
+			preview();
+			f.onsubmit = async (e) => {
+				e.preventDefault();
+				$("#postBtn").disabled = true;
+				try {
+					const c = await api("/charges", { method: "POST", body: JSON.stringify({
+						period: f.period.value, entry_date: f.entry_date.value, seats: Number(f.seats.value), memo: f.memo.value || null }) });
+					flash(`Posted journal entry #${c.entry_id} for ${money(c.total_cents, c.currency)}.`, "ok");
+					await refresh();
+				} catch (err) { flash(err.message); $("#postBtn").disabled = false; }
+			};
+		}
+		el.querySelectorAll("[data-reverse]").forEach((b) => b.onclick = async () => {
+			if (!confirm("Post a reversing journal entry for this charge?")) return;
+			try { await api(`/charges/${b.dataset.reverse}/reverse`, { method: "POST", body: "{}" }); flash("Charge reversed.", "ok"); await refresh(); }
+			catch (err) { flash(err.message); }
+		});
+		el.querySelectorAll("[data-discard]").forEach((b) => b.onclick = async () => {
+			if (!confirm("Discard this pending charge? First check the journal for an entry with reference tailscale:<month>; if one exists, reverse it in Ledger.")) return;
+			try { await api(`/charges/${b.dataset.discard}`, { method: "DELETE" }); await refresh(); }
+			catch (err) { flash(err.message); }
+		});
+	},
+
+	async settings(el) {
+		const s = await api("/settings");
+		const accounts = await api("/accounts").catch(() => []);
+		const opts = (types, cur, sel) => `<option value="">— choose —</option>` + accounts
+			.filter((a) => a.is_active && types.includes(a.type) && (a.currency === cur || a.code === sel))
+			.map((a) => `<option value="${esc(a.code)}" ${a.code === sel ? "selected" : ""}>${esc(a.code)} · ${esc(a.name)} (${esc(a.currency)})</option>`).join("");
+		const secretHint = (set, h) => set ? `<span class="muted small">saved: ${esc(h)} — leave blank to keep</span>` : "";
+		el.innerHTML = `<form id="sf">
+			<fieldset><legend>Connection</legend><div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 14px">
+				<label>Tailnet <input name="tailnet" value="${esc(s.tailnet)}" placeholder="-"><span class="muted small">"-" = the key's own tailnet</span></label>
+				<label>Authentication <select name="auth_mode">
+					<option value="api_key" ${s.auth_mode === "api_key" ? "selected" : ""}>API access token</option>
+					<option value="oauth" ${s.auth_mode === "oauth" ? "selected" : ""}>OAuth client (recommended)</option></select></label>
+				<label data-mode="api_key">API access token <input name="api_key" type="password" autocomplete="off" placeholder="tskey-api-…">${secretHint(s.api_key_set, s.api_key_hint)}</label>
+				<label data-mode="oauth">OAuth client ID <input name="oauth_client_id" autocomplete="off" value="${esc(s.oauth_client_id)}"></label>
+				<label data-mode="oauth">OAuth client secret <input name="oauth_client_secret" type="password" autocomplete="off" placeholder="tskey-client-…">${secretHint(s.oauth_client_secret_set, s.oauth_client_secret_hint)}</label>
+			</div>
+			<p class="muted small">Read-only scopes are enough: <code>devices:core:read</code> and <code>users:read</code>. Secrets are stored in Ledger's database and never shown again.</p>
+			<div class="row"><button type="button" class="link" id="clearSecrets">Remove saved credentials</button></div></fieldset>
+
+			<fieldset><legend>Sync and alerts</legend><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 14px">
+				<label>Sync every (minutes, 0 = off) <input name="sync_minutes" type="number" min="0" max="1440" value="${esc(s.sync_minutes)}"></label>
+				<label>Warn of key expiry (days) <input name="key_expiry_warn_days" type="number" min="1" max="90" value="${esc(s.key_expiry_warn_days)}"></label>
+				<label>Warn when offline (days, 0 = off) <input name="offline_warn_days" type="number" min="0" max="365" value="${esc(s.offline_warn_days)}"></label>
+			</div></fieldset>
+
+			<fieldset><legend>Billing</legend>
+				<label class="check"><input type="checkbox" name="billing_enabled" ${s.billing_enabled ? "checked" : ""}> Record the monthly subscription in the ledger</label>
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 14px;margin-top:10px">
+					<label>Price per user / month <input name="price" inputmode="decimal" value="${esc(centsToInput(s.price_per_user_cents))}"></label>
+					<label>Flat fee / month <input name="base_fee" inputmode="decimal" value="${esc(centsToInput(s.base_fee_cents))}"></label>
+					<label>Currency <select name="currency">${["USD", "CAD"].map((c) => `<option ${c === s.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>
+					<label>Remind me on day <input name="bill_day" type="number" min="1" max="28" value="${esc(s.bill_day)}"></label>
+					<label>Expense account (debit) <select name="expense_account"></select></label>
+					<label>Paid from (credit) <select name="payment_account"></select></label>
+				</div>
+			</fieldset>
+			<div class="row"><button class="primary" id="saveBtn">Save</button><span class="muted small">${s.updated_by ? `Last changed by ${esc(s.updated_by)} ${esc(ago(s.updated_at))}` : ""}</span></div>
+		</form>`;
+		const f = $("#sf");
+		const syncMode = () => el.querySelectorAll("[data-mode]").forEach((l) => l.hidden = l.dataset.mode !== f.auth_mode.value);
+		const syncAccounts = () => {
+			f.expense_account.innerHTML = opts(["expense"], f.currency.value, f.expense_account.value || s.expense_account);
+			f.payment_account.innerHTML = opts(["asset", "liability"], f.currency.value, f.payment_account.value || s.payment_account);
+		};
+		f.auth_mode.onchange = syncMode;
+		f.currency.onchange = syncAccounts;
+		syncMode(); syncAccounts();
+		if (!accounts.length) flash("Could not load accounts from Ledger.");
+
+		const save = async (extra = {}) => {
+			const price = toCents(f.price.value), base = toCents(f.base_fee.value);
+			if (price === null || base === null) throw new Error("Enter prices like 6.00");
+			const body = {
+				tailnet: f.tailnet.value.trim() || "-", auth_mode: f.auth_mode.value,
+				oauth_client_id: f.oauth_client_id.value.trim() || null,
+				sync_minutes: Number(f.sync_minutes.value), key_expiry_warn_days: Number(f.key_expiry_warn_days.value),
+				offline_warn_days: Number(f.offline_warn_days.value), billing_enabled: f.billing_enabled.checked,
+				price_per_user_cents: price, base_fee_cents: base, currency: f.currency.value, bill_day: Number(f.bill_day.value),
+				expense_account: f.expense_account.value || null, payment_account: f.payment_account.value || null, ...extra,
+			};
+			if (f.api_key.value.trim()) body.api_key = f.api_key.value.trim();
+			if (f.oauth_client_secret.value.trim()) body.oauth_client_secret = f.oauth_client_secret.value.trim();
+			const credsChanged = "api_key" in body || "oauth_client_secret" in body || body.tailnet !== s.tailnet
+				|| body.auth_mode !== s.auth_mode || body.oauth_client_id !== s.oauth_client_id;
+			await api("/settings", { method: "PUT", body: JSON.stringify(body) });
+			return credsChanged;
+		};
+		f.onsubmit = async (e) => {
+			e.preventDefault();
+			$("#saveBtn").disabled = true;
+			try {
+				const credsChanged = await save();
+				await loadStatus();
+				if (credsChanged && state.status.configured) {
+					flash("Saved. Testing the connection…", "ok");
+					const r = await api("/sync", { method: "POST", body: "{}" });
+					flash(`Connected: ${r.device_count} devices${r.user_count != null ? `, ${r.user_count} users` : ""}.${r.warning ? " " + r.warning : ""}`, r.warning ? "warn" : "ok");
+				} else flash("Saved.", "ok");
+				await refresh();
+			} catch (err) { flash(err.message); await refresh().catch(() => {}); }
+		};
+		$("#clearSecrets").onclick = async () => {
+			if (!confirm("Remove the saved API token and OAuth client? Syncing stops until you add new ones.")) return;
+			try { await save({ api_key: null, oauth_client_id: null, oauth_client_secret: null }); flash("Credentials removed.", "ok"); await refresh(); }
+			catch (err) { flash(err.message); }
+		};
+	},
+};
+
+async function show(tab) {
+	state.tab = views[tab] ? tab : "overview";
+	try { localStorage.setItem("tailscale.tab", state.tab); } catch {}
+	document.querySelectorAll("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === state.tab)));
+	const el = $("#view");
+	try { await views[state.tab](el); }
+	catch (err) { el.innerHTML = ""; flash(err.message); }
+}
+
+async function refresh() {
+	await loadStatus();
+	await show(state.tab);
+}
+
+$("#tabs").onclick = (e) => { const t = e.target.closest("[data-tab]"); if (t) { flash(""); show(t.dataset.tab); } };
+$("#syncBtn").onclick = async () => {
+	const b = $("#syncBtn");
+	b.disabled = true; b.textContent = "Syncing…";
+	try {
+		const r = await api("/sync", { method: "POST", body: "{}" });
+		flash(r.warning ? r.warning : "", "warn");
+	} catch (err) { flash(err.message); }
+	b.textContent = "Sync now";
+	await refresh().catch((err) => flash(err.message));
+};
+refresh().catch((err) => flash(err.message));
+</script>
+</body>
+</html>

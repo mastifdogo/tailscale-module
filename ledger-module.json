@@ -1,0 +1,11 @@
+{
+  "id": "tailscale",
+  "name": "Tailscale",
+  "version": "1.0.0",
+  "description": "Tailnet devices and users on Ledger's dashboard; records the monthly Tailscale subscription as a journal entry.",
+  "ledger": ">=0.7.0",
+  "server": "server.mjs",
+  "ui": "ui",
+  "nav": { "label": "Tailscale", "icon": "box" },
+  "migrations": "migrations"
+}
