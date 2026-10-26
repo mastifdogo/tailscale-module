@@ -6,11 +6,14 @@
 
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 
 const API = "https://api.tailscale.com/api/v2";
 const SERVE_PORTS = [443, 8443, 10000]; // the ports Tailscale Serve accepts for HTTPS
+const HTTP_PORT = 80;
+const REDIRECT_SINCE = [1, 92, 0]; // first tailscaled whose Serve handlers support Redirect
 const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
 const TIMEOUT_MS = 10_000;
 const LINK = "/apps/tailscale";
@@ -124,16 +127,47 @@ function normalizeTarget(input) {
 	return `${u.protocol === "https:" ? "https+insecure" : "http"}://${h}:${port}`;
 }
 
-// Can we open a TCP connection to a Serve target?
-function probe(target) {
-	const m = /^[a-z+]+:\/\/\[?([^\]]+?)\]?:(\d+)$/.exec(target);
+// Make one HTTP request to a Serve target, the way Tailscale Serve will.
+// Ledger answers an anonymous call to this module's API with its JSON error body,
+// which tells it apart from some other web server on that port.
+function httpProbe(target, moduleId) {
+	const u = new URL(target.replace(/^https\+insecure:/, "https:"));
+	const mod = u.protocol === "https:" ? https : http;
 	return new Promise((resolve) => {
-		if (!m) return resolve(false);
-		const sock = net.connect({ host: m[1], port: Number(m[2]) });
-		sock.setTimeout(3_000, () => (sock.destroy(), resolve(false)));
-		sock.once("connect", () => (sock.end(), resolve(true)));
-		sock.once("error", () => resolve(false));
+		const req = mod.request({
+			host: u.hostname.replace(/^\[|\]$/g, ""), port: u.port, method: "GET",
+			path: `/api/v1/m/${moduleId}/status`, rejectUnauthorized: false, headers: { Accept: "application/json" },
+		}, (res) => {
+			let body = "";
+			res.setEncoding("utf8");
+			res.on("data", (c) => {
+				if (body.length < 8192) body += c;
+			});
+			res.on("end", () => {
+				let ledger = false;
+				try {
+					ledger = typeof JSON.parse(body)?.error === "object";
+				} catch {}
+				resolve({ ok: true, status: res.statusCode, ledger });
+			});
+		});
+		req.setTimeout(3_000, () => req.destroy(Object.assign(new Error("no answer within 3 s"), { code: "ETIMEDOUT" })));
+		req.on("error", (e) => resolve({
+			ok: false,
+			reason: e.code === "ECONNREFUSED" ? "nothing is listening there"
+				: String(e.code ?? "").startsWith("HPE_") ? "what's listening there isn't a web server"
+				: e.code === "EPROTO" || /SSL|TLS/i.test(e.message) ? "it doesn't speak HTTPS (use http://)"
+				: e.message,
+		}));
+		req.end();
 	});
+}
+
+function versionAtLeast(version, min) {
+	const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
+	if (!m) return false;
+	for (let i = 0; i < 3; i++) if (Number(m[i + 1]) !== min[i]) return Number(m[i + 1]) > min[i];
+	return true;
 }
 
 /** @param {any} ctx */
@@ -693,16 +727,22 @@ export default async function register(ctx) {
 	const serveUrl = (dns, port) => `https://${dns}${port === 443 ? "" : `:${port}`}/`;
 
 	// Remove every "/" handler that proxies to `target`, then drop emptied entries.
-	function withoutOurs(cfg, target) {
+	// Our port-80 handler: a redirect to the https address (or, on old tailscaled, a proxy).
+	const httpsRedirect = (dns, port) => `301:${serveUrl(dns, port).slice(0, -1)}\${REQUEST_URI}`;
+	const isOurs = (h, s, dns) => !!h && (h.Proxy === targetOf(s) || (!!dns && h.Redirect === httpsRedirect(dns, s.serve_port)));
+
+	// Remove every "/" handler of ours (optionally only on one port), then drop emptied entries.
+	function withoutOurs(cfg, s, dns, onlyPort) {
 		const web = { ...cfg.Web };
 		for (const [hp, w] of Object.entries(web)) {
-			if (w?.Handlers?.["/"]?.Proxy !== target) continue;
+			if (onlyPort && !hp.endsWith(`:${onlyPort}`)) continue;
+			if (!isOurs(w?.Handlers?.["/"], s, dns)) continue;
 			const { "/": _, ...rest } = w.Handlers;
 			if (Object.keys(rest).length) web[hp] = { ...w, Handlers: rest };
 			else delete web[hp];
 		}
 		const usedPorts = new Set(Object.keys(web).map((hp) => hp.slice(hp.lastIndexOf(":") + 1)));
-		const tcp = Object.fromEntries(Object.entries(cfg.TCP ?? {}).filter(([p, v]) => !v?.HTTPS || usedPorts.has(p)));
+		const tcp = Object.fromEntries(Object.entries(cfg.TCP ?? {}).filter(([p, v]) => !(v?.HTTPS || v?.HTTP) || usedPorts.has(p)));
 		const funnel = Object.fromEntries(Object.entries(cfg.AllowFunnel ?? {}).filter(([hp]) => hp in web));
 		return { ...cfg, Web: web, TCP: tcp, AllowFunnel: funnel };
 	}
@@ -712,7 +752,7 @@ export default async function register(ctx) {
 		const base = {
 			socket_path: s.socket_path, process_user: processUser, target, target_is_default: !s.serve_target,
 			detected_targets: detectedTargets,
-			port: s.serve_port, wanted: s.serve_wanted,
+			port: s.serve_port, wanted: s.serve_wanted, http_wanted: s.serve_http,
 		};
 		let st;
 		try {
@@ -731,6 +771,8 @@ export default async function register(ctx) {
 			https_enabled: Array.isArray(st.CertDomains) && st.CertDomains.length > 0,
 			self: st.Self ? { host_name: st.Self.HostName, dns_name: dns, ips: st.Self.TailscaleIPs ?? [], id: st.Self.ID } : null,
 			serving: false, url: null, conflict: null, funnel: false,
+			http_url: null, http_mode: null, http_conflict: null,
+			http_redirect_supported: versionAtLeast(st.Version, REDIRECT_SINCE),
 		};
 		if (info.backend_state !== "Running" || !dns) return info;
 		try {
@@ -742,6 +784,16 @@ export default async function register(ctx) {
 			info.funnel = info.serving && !!cfg.AllowFunnel?.[hp];
 			if (h && !info.serving) info.conflict = `${serveUrl(dns, s.serve_port)} already serves ${h.Proxy ?? h.Path ?? "something else"}`;
 			else if (cfg.TCP?.[s.serve_port] && !cfg.TCP[s.serve_port].HTTPS) info.conflict = `Port ${s.serve_port} is used for TCP forwarding`;
+
+			const h80 = cfg.Web?.[`${dns}:${HTTP_PORT}`]?.Handlers?.["/"];
+			if (isOurs(h80, s, dns)) {
+				info.http_url = `http://${dns}/`;
+				info.http_mode = h80.Redirect ? "redirect" : "proxy";
+			} else if (h80) info.http_conflict = `http://${dns}/ already serves ${h80.Proxy ?? h80.Path ?? h80.Redirect ?? "something else"}`;
+			else if (cfg.TCP?.[HTTP_PORT] && !cfg.TCP[HTTP_PORT].HTTP) info.http_conflict = `Port ${HTTP_PORT} is used for ${cfg.TCP[HTTP_PORT].HTTPS ? "HTTPS" : "TCP forwarding"}`;
+
+			// What Serve will reach when it forwards a request.
+			if (info.serving) info.target_check = await httpProbe(target, ctx.id);
 		} catch (e) {
 			info.serve_error = e.message; // reading the Serve config can need operator rights
 		}
@@ -780,28 +832,38 @@ export default async function register(ctx) {
 		}
 		const serve_port = b.serve_port === undefined ? cur.serve_port : Number(b.serve_port);
 		if (!SERVE_PORTS.includes(serve_port)) throw bad(`HTTPS port must be one of ${SERVE_PORTS.join(", ")}`);
+		const serve_http = b.serve_http === undefined ? cur.serve_http : b.serve_http;
+		if (typeof serve_http !== "boolean") throw bad("serve_http must be true or false");
 		const changesServe = targetOf(cur) !== (serve_target ?? defaultTarget) || serve_port !== cur.serve_port;
-		if (changesServe && (await nodeInfo(cur)).serving) throw new ctx.HttpError(409, "Stop sharing Ledger on the tailnet before changing its address or port");
+		const serving = (await nodeInfo(cur)).serving;
+		if (changesServe && serving) throw new ctx.HttpError(409, "Stop sharing Ledger on the tailnet before changing its address or port");
 		await ctx.db.query(
-			`UPDATE ${S}.settings SET socket_path = $1, serve_target = $2, serve_port = $3, updated_by = $4, updated_at = now() WHERE id`,
-			[socket_path, serve_target, serve_port, req.user.username]);
-		return nodeInfo(await getSettings());
+			`UPDATE ${S}.settings SET socket_path = $1, serve_target = $2, serve_port = $3, serve_http = $4,
+				updated_by = $5, updated_at = now() WHERE id`,
+			[socket_path, serve_target, serve_port, serve_http, req.user.username]);
+		const s = await getSettings();
+		if (serving && serve_http !== cur.serve_http) await applyServe(s, req.user.username);
+		return nodeInfo(s);
 	});
 
-	ctx.route("POST", "/node/serve", async (req) => {
-		const s = await getSettings();
+	// Write Ledger's Serve entries: https on serve_port, and http on port 80 if wanted.
+	async function applyServe(s, username) {
 		const target = targetOf(s);
 		const st = await nodeStatus(s);
 		if (st.BackendState !== "Running") throw bad(`Tailscale on the Ledger server is not connected (${st.BackendState}). Log it in first`);
 		const dns = selfDns(st);
 		if (!dns) throw bad("This machine has no MagicDNS name: turn on MagicDNS in the Tailscale admin console (DNS page)");
 		if (!st.CertDomains?.length) throw bad("Turn on HTTPS Certificates in the Tailscale admin console (DNS page), then try again");
-		if (!(await probe(target))) {
-			throw bad(`Nothing answers at ${target.replace("https+insecure", "https")}. Set the address Ledger listens on under Advanced`);
+		const check = await httpProbe(target, ctx.id);
+		if (!check.ok) {
+			throw bad(`Ledger isn't reachable at ${target.replace("https+insecure", "https")}: ${check.reason}. Set the address Ledger listens on under Advanced`);
+		}
+		if (!check.ledger) {
+			throw bad(`${target.replace("https+insecure", "https")} answers (HTTP ${check.status}) but it isn't Ledger. Set the address Ledger listens on under Advanced`);
 		}
 
 		const { body, etag } = await localJson(s, "GET", "/serve-config");
-		const cfg = body ?? {};
+		let cfg = body ?? {};
 		const hp = `${dns}:${s.serve_port}`;
 		const existing = cfg.Web?.[hp]?.Handlers?.["/"];
 		if (existing && existing.Proxy !== target) {
@@ -809,22 +871,41 @@ export default async function register(ctx) {
 		}
 		const tcp = cfg.TCP?.[s.serve_port];
 		if (tcp && !tcp.HTTPS) throw new ctx.HttpError(409, `Port ${s.serve_port} is used for TCP forwarding. Pick another HTTPS port`);
-		const next = {
+		cfg = {
 			...cfg,
 			TCP: { ...cfg.TCP, [s.serve_port]: { ...tcp, HTTPS: true } },
 			Web: { ...cfg.Web, [hp]: { ...cfg.Web?.[hp], Handlers: { ...cfg.Web?.[hp]?.Handlers, "/": { Proxy: target } } } },
 		};
-		await localJson(s, "POST", "/serve-config", next, etag ? { "If-Match": etag } : {});
+
+		// Plain http:// on port 80. Skipped (not an error) if something else already uses it.
+		cfg = withoutOurs(cfg, s, dns, HTTP_PORT);
+		const hp80 = `${dns}:${HTTP_PORT}`;
+		const tcp80 = cfg.TCP?.[HTTP_PORT];
+		if (s.serve_http && !cfg.Web?.[hp80]?.Handlers?.["/"] && !(tcp80 && !tcp80.HTTP)) {
+			const handler = versionAtLeast(st.Version, REDIRECT_SINCE) ? { Redirect: httpsRedirect(dns, s.serve_port) } : { Proxy: target };
+			cfg = {
+				...cfg,
+				TCP: { ...cfg.TCP, [HTTP_PORT]: { ...tcp80, HTTP: true } },
+				Web: { ...cfg.Web, [hp80]: { ...cfg.Web?.[hp80], Handlers: { ...cfg.Web?.[hp80]?.Handlers, "/": handler } } },
+			};
+		}
+
+		await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
 		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`);
-		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), target, by: req.user.username });
+		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), http: s.serve_http, target, by: username });
 		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+	}
+
+	ctx.route("POST", "/node/serve", async (req) => {
+		await applyServe(await getSettings(), req.user.username);
 		return nodeInfo(await getSettings());
 	});
 
 	ctx.route("DELETE", "/node/serve", async (req) => {
 		const s = await getSettings();
 		const { body, etag } = await localJson(s, "GET", "/serve-config");
-		if (body) await localJson(s, "POST", "/serve-config", withoutOurs(body, targetOf(s)), etag ? { "If-Match": etag } : {});
+		const dns = await nodeStatus(s).then(selfDns, () => "");
+		if (body) await localJson(s, "POST", "/serve-config", withoutOurs(body, s, dns), etag ? { "If-Match": etag } : {});
 		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`);
 		ctx.log.info("ledger unpublished from tailnet", { by: req.user.username });
 		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));

@@ -166,7 +166,14 @@ const views = {
 			const self = n.self || {};
 			html += `<p>This server is <b>${esc(self.host_name)}</b> on tailnet <b>${esc(n.tailnet)}</b> <span class="muted">(${esc((self.ips || []).join(", "))})</span>.</p>`;
 			if (n.serving) {
-				html += `<div class="msg ok"><span>Ledger is shared with your tailnet at<br><a class="big" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.url)}</a></span></div>
+				const tc = n.target_check;
+				const shownTarget = n.target.replace("https+insecure", "https");
+				html += `<div class="msg ok"><span>Ledger is shared with your tailnet at<br><a class="big" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.url)}</a>
+					${n.http_url ? `<br><span class="small">and <a href="${esc(n.http_url)}" target="_blank" rel="noopener">${esc(n.http_url)}</a>${n.http_mode === "redirect" ? " (redirects to https)" : ""}</span>` : ""}</span></div>
+					${n.http_wanted && !n.http_url ? `<div class="msg warn"><span>Plain http:// isn't set up${n.http_conflict ? `: ${esc(n.http_conflict)}` : ""}. <button class="link" id="reapply">Set it up</button></span></div>` : ""}
+					${n.http_mode === "proxy" ? `<p class="muted small">Your Tailscale (${esc((n.version || "").split("-")[0])}) can't redirect, so http:// serves Ledger directly. Update Tailscale to 1.92 or later to redirect to https instead.</p>` : ""}
+					${tc && !tc.ok ? `<div class="msg danger"><span>Tailscale forwards to ${esc(shownTarget)}, but Ledger isn't reachable there: ${esc(tc.reason)}. Visitors get “502”. Fix the address under Advanced (stop sharing first).</span></div>` : ""}
+					${tc && tc.ok && !tc.ledger ? `<div class="msg danger"><span>${esc(shownTarget)} answers (HTTP ${esc(tc.status)}) but it isn't Ledger. Fix the address under Advanced (stop sharing first).</span></div>` : ""}
 					${n.funnel ? `<div class="msg danger"><span>Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with <code>tailscale funnel reset</code> unless that's intended.</span></div>` : ""}
 					<p class="muted small">Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual.</p>
 					<button id="unserve">Stop sharing</button>`;
@@ -180,7 +187,7 @@ const views = {
 				html += `${n.wanted ? `<div class="msg warn"><span>Ledger was shared on the tailnet but isn't any more.</span></div>` : ""}
 					${problems.map((p) => `<div class="msg warn"><span>${esc(p)}</span></div>`).join("")}
 					<p>Share Ledger with your tailnet over HTTPS at
-					<b>https://${esc(self.dns_name)}${n.port === 443 ? "" : ":" + n.port}/</b> (Tailscale Serve). It is not exposed to the internet.</p>
+					<b>https://${esc(self.dns_name)}${n.port === 443 ? "" : ":" + n.port}/</b>${n.http_wanted ? ` (and <b>http://${esc(self.dns_name)}/</b>${n.http_redirect_supported ? ", which redirects there" : ""})` : ""} using Tailscale Serve. It is not exposed to the internet.</p>
 					<button class="primary" id="serve">Share Ledger on the tailnet</button>`;
 			}
 		}
@@ -190,6 +197,7 @@ const views = {
 					<span class="muted small">${n.detected_targets?.length ? `Detected: ${esc(n.detected_targets.join(", "))}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000)."}</span></label>
 				<label>HTTPS port <select name="serve_port">${[443, 8443, 10000].map((p) => `<option ${p === n.port ? "selected" : ""}>${p}</option>`).join("")}</select></label>
 				<label>tailscaled socket <input name="socket_path" value="${esc(n.socket_path)}"></label>
+				<label class="check"><input type="checkbox" name="serve_http" ${n.http_wanted ? "checked" : ""}> Also answer plain http://</label>
 				<div><button>Save</button></div>
 			</form>
 			<p class="muted small">Ledger runs as <code>${esc(n.process_user)}</code>${n.version ? ` · Tailscale ${esc(n.version.split("-")[0])}` : ""}.</p></details>`;
@@ -202,6 +210,7 @@ const views = {
 		});
 		act("#recheck", async () => flash(""));
 		act("#serve", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`);
+		act("#reapply", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => r.http_url ? `Ledger also answers at ${r.http_url}` : "Updated.");
 		act("#unserve", async () => {
 			if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) throw new Error("Cancelled.");
 			return api("/node/serve", { method: "DELETE" });
@@ -215,7 +224,8 @@ const views = {
 			const f = e.target;
 			try {
 				await api("/node/settings", { method: "PUT", body: JSON.stringify({
-					serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value), socket_path: f.socket_path.value.trim() }) });
+					serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value), socket_path: f.socket_path.value.trim(),
+					serve_http: f.serve_http.checked }) });
 				flash("Saved.", "ok"); await show("access");
 			} catch (err) { flash(err.message); }
 		};
