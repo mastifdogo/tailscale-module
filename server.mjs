@@ -67,13 +67,16 @@ function ownListeners() {
 			} catch {}
 		}
 		const out = [];
-		for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+		for (const name of ["tcp", "tcp6"]) {
+			// /proc/self/net stays readable under systemd ProcSubset=pid, which hides /proc/net.
 			let text;
-			try {
-				text = fs.readFileSync(file, "utf8");
-			} catch {
-				continue;
+			for (const file of [`/proc/self/net/${name}`, `/proc/net/${name}`]) {
+				try {
+					text = fs.readFileSync(file, "utf8");
+					break;
+				} catch {}
 			}
+			if (!text) continue;
 			for (const line of text.trim().split("\n").slice(1)) {
 				const c = line.trim().split(/\s+/);
 				if (c[3] !== "0A" || !inodes.has(c[9])) continue; // 0A = LISTEN
@@ -92,7 +95,9 @@ const hostFor = (ip) => (ip === "0.0.0.0" || ip === "::" ? "127.0.0.1" : ip.incl
 // This machine's own addresses: Ledger may only be published from here.
 function ownAddresses() {
 	const set = new Set(["127.0.0.1", "::1", "localhost"]);
-	for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) set.add(a.address.split("%")[0]);
+	try {
+		for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) set.add(a.address.split("%")[0]);
+	} catch {} // throws under systemd RestrictAddressFamilies without AF_NETLINK: loopback only then
 	return set;
 }
 
@@ -135,6 +140,20 @@ function probe(target) {
 export default async function register(ctx) {
 	const S = ctx.schema;
 	const bad = (msg) => new ctx.HttpError(422, msg);
+	const route = ctx.route.bind(ctx);
+	ctx = Object.create(ctx, {
+		route: {
+			value: (method, path, handler) => route(method, path, async (req) => {
+				try {
+					return await handler(req);
+				} catch (e) {
+					if (e instanceof ctx.HttpError || e?.status || e?.statusCode) throw e; // ours, or Ledger's own 4xx
+					ctx.log.error("tailscale module error", { route: `${method} ${path}`, error: String(e?.stack ?? e) });
+					throw new ctx.HttpError(500, `Tailscale module error: ${String(e?.message ?? e).slice(0, 300)}`);
+				}
+			}),
+		},
+	});
 	/** @type {{ value: string, exp: number, clientId: string } | null} */
 	let oauthToken = null;
 	/** @type {Promise<any> | null} */
@@ -642,7 +661,7 @@ export default async function register(ctx) {
 					reject(bad(`Tailscale isn't running on the Ledger server (no tailscaled at ${socketPath}). Install Tailscale there and run  sudo tailscale up`));
 				} else if (e.code === "EACCES") {
 					reject(bad(`Ledger may not use ${socketPath}: ${operatorHint()}`));
-				} else reject(e);
+				} else reject(new ctx.HttpError(502, `tailscaled: ${e.message}`));
 			});
 			if (data) req.write(data);
 			req.end();
@@ -664,7 +683,7 @@ export default async function register(ctx) {
 			try {
 				msg = JSON.parse(msg).error ?? msg;
 			} catch {}
-			throw new Error(`tailscaled ${path.split("?")[0]}: ${String(msg).slice(0, 200) || `HTTP ${r.status}`}`);
+			throw new ctx.HttpError(502, `tailscaled ${path.split("?")[0]}: ${String(msg).slice(0, 200) || `HTTP ${r.status}`}`);
 		}
 		return { body: r.text.trim() && r.text.trim() !== "null" ? JSON.parse(r.text) : null, etag: r.headers.etag };
 	}
