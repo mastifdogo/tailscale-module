@@ -20,6 +20,8 @@
 	header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
 	h1 { font-size: 20px; margin: 0; flex: 1 1 auto; }
 	h2 { font-size: 16px; margin: 20px 0 8px; }
+	h2:first-child { margin-top: 0; }
+	a { color: var(--accent); }
 	.muted { color: var(--muted); }
 	.small { font-size: 13px; }
 	button, input, select { font: inherit; color: inherit; }
@@ -46,12 +48,10 @@
 	.badge { display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 10px; border: 1px solid currentColor; white-space: nowrap; margin: 1px 2px 1px 0; }
 	.ok { color: var(--ok); } .warn { color: var(--warn); } .danger { color: var(--danger); }
 	.msg { padding: 8px 12px; border-radius: var(--radius); border: 1px solid currentColor; margin-bottom: 12px; }
-	.msg span { color: var(--text); }
-	form.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px 14px; }
+	.msg > span { color: var(--text); }
+	.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 14px; }
 	label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
 	label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 15px; }
-	fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px 14px; margin: 0 0 14px; }
-	legend { padding: 0 6px; font-weight: 600; }
 	.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 	.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 	.toolbar input { flex: 1 1 160px; width: auto; }
@@ -59,6 +59,7 @@
 	pre { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
 	.big { font-size: 17px; word-break: break-all; }
 	.steps { padding-left: 20px; } .steps li { margin: 4px 0; }
+	details { margin-top: 18px; }
 	@media (max-width: 560px) { .opt { display: none; } main { padding: 12px; } }
 </style>
 </head>
@@ -67,7 +68,7 @@
 	<header>
 		<h1>Tailscale</h1>
 		<span id="synced" class="muted small"></span>
-		<button id="syncBtn">Sync now</button>
+		<button id="syncBtn" hidden>Sync now</button>
 	</header>
 	<div id="msg" hidden></div>
 	<nav role="tablist" id="tabs">
@@ -76,12 +77,13 @@
 		<button role="tab" data-tab="devices">Devices</button>
 		<button role="tab" data-tab="users">Users</button>
 		<button role="tab" data-tab="billing">Billing</button>
-		<button role="tab" data-tab="settings">Settings</button>
 	</nav>
 	<section id="view"></section>
 </main>
 <script>
 "use strict";
+const SETTINGS_URL = "/settings/m/tailscale";
+
 const api = (path, opts = {}) =>
 	fetch(`/api/v1/m/tailscale${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } })
 		.then(async (r) => {
@@ -92,11 +94,34 @@ const api = (path, opts = {}) =>
 			return r.status === 204 ? null : r.json();
 		});
 
-const $ = (s, root = document) => root.querySelector(s);
-const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+// h("p", { class: "muted", onclick: fn }, "text", child, [more]) — all text goes in as text nodes.
+function h(tag, props, ...children) {
+	const el = document.createElement(tag);
+	for (const [k, v] of Object.entries(props || {})) {
+		if (v === null || v === undefined || v === false) continue;
+		if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+		else if (k === "class") el.className = v;
+		else if (k in el && k !== "list") el[k] = v;
+		else el.setAttribute(k, v === true ? "" : String(v));
+	}
+	for (const c of children.flat(Infinity)) {
+		if (c === null || c === undefined || c === false) continue;
+		el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+	}
+	return el;
+}
+const $ = (s) => document.querySelector(s);
+const replace = (el, ...children) => { el.replaceChildren(); for (const c of children.flat(Infinity)) if (c) el.append(c instanceof Node ? c : String(c)); };
+const ext = (href, text, cls) => h("a", { href, target: "_blank", rel: "noopener", class: cls }, text);
+// Ledger's own pages open in the top window, not in this iframe.
+const ledgerLink = (href, text) => h("a", { href, target: "_top" }, text);
+const msg = (kind, ...children) => h("div", { class: `msg ${kind}` }, h("span", null, ...children));
+const cmd = (text) => h("pre", null, text);
+const badge = (text, cls = "") => h("span", { class: `badge ${cls}` }, text);
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 const money = (cents, cur) => `${(Number(cents) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`;
 const short = (n) => String(n || "").split(".")[0];
-const fmtDate = (d) => (d ? new Date(d).toLocaleString() : "—");
 function ago(d) {
 	if (!d) return "never";
 	const s = (Date.now() - new Date(d).getTime()) / 1000;
@@ -104,138 +129,148 @@ function ago(d) {
 	const [n, u] = a < 60 ? [a, "s"] : a < 3600 ? [a / 60, "min"] : a < 86400 ? [a / 3600, "h"] : [a / 86400, "d"];
 	return fut ? `in ${Math.round(n)} ${u}` : `${Math.round(n)} ${u} ago`;
 }
-// "6.00" → 600; null if not a valid amount.
-function toCents(s) {
-	const m = /^\s*(\d{1,9})(?:\.(\d{1,2}))?\s*$/.exec(s);
-	return m ? Number(m[1]) * 100 + Number((m[2] || "0").padEnd(2, "0")) : null;
+function table(head, rows, empty) {
+	return h("div", { class: "wrap" }, h("table", null,
+		h("thead", null, h("tr", null, head.map(([text, cls]) => h("th", { class: cls }, text)))),
+		h("tbody", null, rows.length ? rows : h("tr", null, h("td", { colspan: head.length, class: "muted" }, empty)))));
 }
-const centsToInput = (c) => (Number(c) / 100).toFixed(2);
 
 let state = { status: null, tab: "access", filter: "" };
 try { state.tab = localStorage.getItem("tailscale.tab") || "access"; } catch {}
+const isAdmin = () => state.status?.role === "admin";
+const settingsHint = (what) => isAdmin()
+	? [what, " under ", ledgerLink(SETTINGS_URL, "Settings → Tailscale"), "."]
+	: [what, " under Settings → Tailscale (ask an admin)."];
 
 function flash(text, kind = "danger") {
 	const m = $("#msg");
 	if (!text) { m.hidden = true; return; }
 	m.className = `msg ${kind}`;
-	m.innerHTML = `<span>${esc(text)}</span>`;
+	replace(m, h("span", null, text));
 	m.hidden = false;
 }
 
 async function loadStatus() {
 	state.status = await api("/status");
-	const st = state.status;
-	const ls = st.last_sync;
-	$("#synced").innerHTML = !st.configured ? "No API credentials"
+	const st = state.status, ls = st.last_sync;
+	replace($("#synced"), !st.configured ? "No API credentials"
 		: !ls ? "Never synced"
-		: ls.ok === false ? `<span class="danger">Last sync failed ${esc(ago(ls.started_at))}</span>`
-		: ls.ok ? `Synced ${esc(ago(ls.finished_at))}` : "Syncing…";
-	$("#syncBtn").disabled = !st.configured;
+		: ls.ok === false ? h("span", { class: "danger" }, `Last sync failed ${ago(ls.started_at)}`)
+		: ls.ok ? `Synced ${ago(ls.finished_at)}` : "Syncing…");
+	$("#syncBtn").hidden = !st.configured || st.role === "viewer";
 }
 
 const views = {
 	async access(el) {
 		const n = await api("/node");
-		const cmd = (c) => `<pre>${esc(c)}</pre>`;
-		let html = `<h2 style="margin-top:0">Ledger on your tailnet</h2>`;
+		const admin = isAdmin();
+		const out = [h("h2", null, "Ledger on your tailnet")];
+		const act = (label, cls, fn, okMsg) => h("button", { class: cls, async onclick(e) {
+			e.target.disabled = true;
+			try { const r = await fn(); if (r === undefined) return show("access"); if (okMsg) flash(okMsg(r), "ok"); await show("access"); }
+			catch (err) { flash(err.message); e.target.disabled = false; }
+		} }, label);
+		const recheck = act("Check again", "", async () => flash(""));
+
 		if (!n.reachable && n.not_ready) {
-			html += `<div class="msg warn"><span>Tailscale is installed and running on the Ledger server, but its service hasn't started properly.</span></div>
-				<ol class="steps">
-					<li>If it was just installed or restarted, wait a few seconds and check again.</li>
-					<li>Look at its log for the cause: ${cmd("sudo journalctl -u tailscaled -n 50 --no-pager")}</li>
-					<li>If the log mentions <code>/dev/net/tun</code> (common in LXC containers), run it in userspace mode, which Tailscale Serve supports:
-						${cmd(`echo 'FLAGS="--tun=userspace-networking"' | sudo tee -a /etc/default/tailscaled\nsudo systemctl restart tailscaled\nsudo tailscale up`)}</li>
-				</ol>
-				<p class="muted small">${esc(n.error)}</p>
-				<button id="recheck">Check again</button>`;
+			out.push(msg("warn", "Tailscale is installed and running on the Ledger server, but its service hasn't started properly."),
+				h("ol", { class: "steps" },
+					h("li", null, "If it was just installed or restarted, wait a few seconds and check again."),
+					h("li", null, "Look at its log for the cause: ", cmd("sudo journalctl -u tailscaled -n 50 --no-pager")),
+					h("li", null, "If the log mentions /dev/net/tun (common in LXC containers), run it in userspace mode, which Tailscale Serve supports:",
+						cmd(`echo 'FLAGS="--tun=userspace-networking"' | sudo tee -a /etc/default/tailscaled\nsudo systemctl restart tailscaled\nsudo tailscale up`))),
+				h("p", { class: "muted small" }, n.error), recheck);
 		} else if (!n.reachable) {
-			html += `<div class="msg warn"><span>${esc(n.error)}</span></div>
-				<p>To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:</p>
-				<ol class="steps">
-					<li>Install Tailscale: ${cmd("curl -fsSL https://tailscale.com/install.sh | sh")}</li>
-					<li>Join your tailnet: ${cmd("sudo tailscale up")}</li>
-					<li>Let Ledger manage Tailscale Serve: ${cmd(`sudo tailscale set --operator=${n.process_user}`)}</li>
-				</ol>
-				<button id="recheck">Check again</button>`;
+			out.push(msg("warn", n.error),
+				h("p", null, "To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:"),
+				h("ol", { class: "steps" },
+					h("li", null, "Install Tailscale: ", cmd("curl -fsSL https://tailscale.com/install.sh | sh")),
+					h("li", null, "Join your tailnet: ", cmd("sudo tailscale up")),
+					h("li", null, "Let Ledger manage Tailscale Serve: ", cmd(`sudo tailscale set --operator=${n.process_user}`))),
+				recheck);
 		} else if (n.backend_state !== "Running") {
-			html += `<p>Tailscale is installed on the Ledger server but not connected (<b>${esc(n.backend_state)}</b>).</p>
-				${n.auth_url ? `<p><a class="big" href="${esc(n.auth_url)}" target="_blank" rel="noopener">Approve this server in Tailscale ↗</a></p>` : ""}
-				<div class="row"><button class="primary" id="login">Log this server in</button><button id="recheck">Check again</button></div>
-				<p class="muted small">Or on the server: <code>sudo tailscale up</code></p>`;
+			out.push(h("p", null, "Tailscale is installed on the Ledger server but not connected (", h("b", null, n.backend_state), ")."),
+				n.auth_url && h("p", null, ext(n.auth_url, "Approve this server in Tailscale ↗", "big")),
+				h("div", { class: "row" },
+					admin && act("Log this server in", "primary", async () => {
+						const r = await api("/node/login", { method: "POST", body: "{}" });
+						if (r.auth_url) window.open(r.auth_url, "_blank", "noopener");
+					}),
+					recheck),
+				h("p", { class: "muted small" }, "Or on the server: sudo tailscale up"));
 		} else {
 			const self = n.self || {};
-			html += `<p>This server is <b>${esc(self.host_name)}</b> on tailnet <b>${esc(n.tailnet)}</b> <span class="muted">(${esc((self.ips || []).join(", "))})</span>.</p>`;
+			out.push(h("p", null, "This server is ", h("b", null, self.host_name), " on tailnet ", h("b", null, n.tailnet), " ",
+				h("span", { class: "muted" }, `(${(self.ips || []).join(", ")})`), "."));
+			const shownTarget = n.target.replace("https+insecure", "https");
 			if (n.serving) {
 				const tc = n.target_check;
-				const shownTarget = n.target.replace("https+insecure", "https");
-				html += `<div class="msg ok"><span>Ledger is shared with your tailnet at<br><a class="big" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.url)}</a>
-					${n.http_url ? `<br><span class="small">and <a href="${esc(n.http_url)}" target="_blank" rel="noopener">${esc(n.http_url)}</a>${n.http_mode === "redirect" ? " (redirects to https)" : ""}</span>` : ""}</span></div>
-					${n.http_wanted && !n.http_url ? `<div class="msg warn"><span>Plain http:// isn't set up${n.http_conflict ? `: ${esc(n.http_conflict)}` : ""}. <button class="link" id="reapply">Set it up</button></span></div>` : ""}
-					${n.http_mode === "proxy" ? `<p class="muted small">Your Tailscale (${esc((n.version || "").split("-")[0])}) can't redirect, so http:// serves Ledger directly. Update Tailscale to 1.92 or later to redirect to https instead.</p>` : ""}
-					${tc && !tc.ok ? `<div class="msg danger"><span>Tailscale forwards to ${esc(shownTarget)}, but Ledger isn't reachable there: ${esc(tc.reason)}. Visitors get “502”. Fix the address under Advanced (stop sharing first).</span></div>` : ""}
-					${tc && tc.ok && !tc.ledger ? `<div class="msg danger"><span>${esc(shownTarget)} answers (HTTP ${esc(tc.status)}) but it isn't Ledger. Fix the address under Advanced (stop sharing first).</span></div>` : ""}
-					${n.funnel ? `<div class="msg danger"><span>Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with <code>tailscale funnel reset</code> unless that's intended.</span></div>` : ""}
-					<p class="muted small">Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual.</p>
-					<button id="unserve">Stop sharing</button>`;
+				out.push(msg("ok", "Ledger is shared with your tailnet at", h("br"), ext(n.url, n.url, "big"),
+					n.http_url && [h("br"), h("span", { class: "small" }, "and ", ext(n.http_url, n.http_url),
+						n.http_mode === "redirect" ? " (redirects to https)" : "")]));
+				if (n.http_wanted && !n.http_url) {
+					out.push(msg("warn", `Plain http:// isn't set up${n.http_conflict ? `: ${n.http_conflict}` : ""}. `,
+						admin && act("Set it up", "link", () => api("/node/serve", { method: "POST", body: "{}" }),
+							(r) => (r.http_url ? `Ledger also answers at ${r.http_url}` : "Updated."))));
+				}
+				if (n.http_mode === "proxy") {
+					out.push(h("p", { class: "muted small" }, `Your Tailscale (${(n.version || "").split("-")[0]}) can't redirect, so http:// serves Ledger directly. Update Tailscale to 1.92 or later to redirect to https instead.`));
+				}
+				if (n.funnel) out.push(msg("danger", "Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with  tailscale funnel reset  unless that's intended."));
+				if (tc && !tc.ok) out.push(msg("danger", `Tailscale forwards to ${shownTarget}, but Ledger isn't reachable there: ${tc.reason}. Visitors get “502”. Fix the address under Advanced (stop sharing first).`));
+				if (tc && tc.ok && !tc.ledger) out.push(msg("danger", `${shownTarget} answers (HTTP ${tc.status}) but it isn't Ledger. Fix the address under Advanced (stop sharing first).`));
+				out.push(h("p", { class: "muted small" }, "Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual."),
+					admin && act("Stop sharing", "", async () => {
+						if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) return;
+						return api("/node/serve", { method: "DELETE" });
+					}, () => "Ledger is no longer shared on the tailnet."));
 			} else {
 				const problems = [
 					n.magic_dns === false && "Turn on MagicDNS in the Tailscale admin console (DNS page).",
 					!n.https_enabled && "Turn on HTTPS Certificates in the Tailscale admin console (DNS page).",
-					n.conflict && `${n.conflict}. Choose another HTTPS port below.`,
-					n.serve_error && n.serve_error,
+					n.conflict && `${n.conflict}. Choose another HTTPS port under Advanced.`,
+					n.serve_error,
 				].filter(Boolean);
-				html += `${n.wanted ? `<div class="msg warn"><span>Ledger was shared on the tailnet but isn't any more.</span></div>` : ""}
-					${problems.map((p) => `<div class="msg warn"><span>${esc(p)}</span></div>`).join("")}
-					<p>Share Ledger with your tailnet over HTTPS at
-					<b>https://${esc(self.dns_name)}${n.port === 443 ? "" : ":" + n.port}/</b>${n.http_wanted ? ` (and <b>http://${esc(self.dns_name)}/</b>${n.http_redirect_supported ? ", which redirects there" : ""})` : ""} using Tailscale Serve. It is not exposed to the internet.</p>
-					<button class="primary" id="serve">Share Ledger on the tailnet</button>`;
+				const https = `https://${self.dns_name}${n.port === 443 ? "" : ":" + n.port}/`;
+				out.push(n.wanted && msg("warn", "Ledger was shared on the tailnet but isn't any more."),
+					problems.map((p) => msg("warn", p)),
+					h("p", null, "Share Ledger with your tailnet over HTTPS at ", h("b", null, https),
+						n.http_wanted ? [" (and ", h("b", null, `http://${self.dns_name}/`), n.http_redirect_supported ? ", which redirects there" : "", ")"] : "",
+						" using Tailscale Serve. It is not exposed to the internet."),
+					admin ? act("Share Ledger on the tailnet", "primary", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`)
+						: h("p", { class: "muted" }, "An admin can share it from here."));
 			}
 		}
-		html += `<details style="margin-top:18px"><summary class="muted">Advanced</summary>
-			<form id="nf" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px;margin-top:10px">
-				<label>Ledger address on this server <input name="serve_target" value="${n.target_is_default ? "" : esc(n.target.replace("https+insecure", "https"))}" placeholder="${esc(n.target)}">
-					<span class="muted small">${n.detected_targets?.length ? `Detected: ${esc(n.detected_targets.join(", "))}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000)."}</span></label>
-				<label>HTTPS port <select name="serve_port">${[443, 8443, 10000].map((p) => `<option ${p === n.port ? "selected" : ""}>${p}</option>`).join("")}</select></label>
-				<label>tailscaled socket <input name="socket_path" value="${esc(n.socket_path)}"></label>
-				<label class="check"><input type="checkbox" name="serve_http" ${n.http_wanted ? "checked" : ""}> Also answer plain http://</label>
-				<div><button>Save</button></div>
-			</form>
-			<p class="muted small">Ledger runs as <code>${esc(n.process_user)}</code>${n.version ? ` · Tailscale ${esc(n.version.split("-")[0])}` : ""}.</p></details>`;
-		el.innerHTML = html;
 
-		const act = (id, fn, okMsg) => $(id)?.addEventListener("click", async (e) => {
-			e.target.disabled = true;
-			try { const r = await fn(); if (okMsg) flash(okMsg(r), "ok"); await show("access"); }
-			catch (err) { flash(err.message); e.target.disabled = false; }
-		});
-		act("#recheck", async () => flash(""));
-		act("#serve", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`);
-		act("#reapply", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => r.http_url ? `Ledger also answers at ${r.http_url}` : "Updated.");
-		act("#unserve", async () => {
-			if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) throw new Error("Cancelled.");
-			return api("/node/serve", { method: "DELETE" });
-		}, () => "Ledger is no longer shared on the tailnet.");
-		act("#login", async () => {
-			const r = await api("/node/login", { method: "POST", body: "{}" });
-			if (r.auth_url) window.open(r.auth_url, "_blank", "noopener");
-		});
-		$("#nf").onsubmit = async (e) => {
-			e.preventDefault();
-			const f = e.target;
-			try {
-				await api("/node/settings", { method: "PUT", body: JSON.stringify({
-					serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value), socket_path: f.socket_path.value.trim(),
-					serve_http: f.serve_http.checked }) });
-				flash("Saved.", "ok"); await show("access");
-			} catch (err) { flash(err.message); }
-		};
+		if (admin) {
+			const f = h("form", { class: "grid", async onsubmit(e) {
+				e.preventDefault();
+				try {
+					await api("/node/settings", { method: "PUT", body: JSON.stringify({
+						serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value),
+						socket_path: f.socket_path.value.trim(), serve_http: f.serve_http.checked }) });
+					flash("Saved.", "ok"); await show("access");
+				} catch (err) { flash(err.message); }
+			} },
+				h("label", null, "Ledger address on this server",
+					h("input", { name: "serve_target", value: n.target_is_default ? "" : n.target.replace("https+insecure", "https"), placeholder: n.target }),
+					h("span", { class: "muted small" }, n.detected_targets?.length
+						? `Detected: ${n.detected_targets.join(", ")}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000).")),
+				h("label", null, "HTTPS port", h("select", { name: "serve_port" },
+					[443, 8443, 10000].map((p) => h("option", { value: p, selected: p === n.port }, p)))),
+				h("label", null, "tailscaled socket", h("input", { name: "socket_path", value: n.socket_path })),
+				h("label", { class: "check" }, h("input", { type: "checkbox", name: "serve_http", checked: n.http_wanted }), "Also answer plain http://"),
+				h("div", null, h("button", null, "Save")));
+			out.push(h("details", null, h("summary", { class: "muted" }, "Advanced"), h("div", { style: "margin-top:10px" }, f),
+				h("p", { class: "muted small" }, `Ledger runs as ${n.process_user}`, n.version ? ` · Tailscale ${n.version.split("-")[0]}` : "", ".")));
+		}
+		replace(el, out);
 	},
 
 	async overview(el) {
 		const st = state.status, c = st.counts;
 		if (!st.configured) {
-			el.innerHTML = `<p>Add Tailscale API credentials to see your tailnet's devices and users here.</p><button class="primary" id="goSettings">Open settings</button>`;
-			$("#goSettings").onclick = () => show("settings");
+			replace(el, h("p", null, ...settingsHint("To see your tailnet's devices and users here, add Tailscale API credentials")));
 			return;
 		}
 		const ls = st.last_sync;
@@ -243,226 +278,136 @@ const views = {
 		const days = st.settings.key_expiry_warn_days;
 		const soon = devices.filter((d) => d.expires && new Date(d.expires) < Date.now() + days * 864e5)
 			.sort((a, b) => new Date(a.expires) - new Date(b.expires));
-		el.innerHTML = `
-			${ls?.ok === false ? `<div class="msg danger"><span>${esc(ls.error)}</span></div>` : ""}
-			${ls?.warning ? `<div class="msg warn"><span>${esc(ls.warning)}</span></div>` : ""}
-			<div class="cards">
-				<div class="card"><b>${c.devices}</b><span class="muted">devices</span></div>
-				<div class="card"><b class="ok">${c.online}</b><span class="muted">online</span></div>
-				<div class="card"><b class="${c.expiring ? "warn" : ""}">${c.expiring}</b><span class="muted">keys expiring</span></div>
-				<div class="card"><b>${c.updates}</b><span class="muted">updates available</span></div>
-				<div class="card"><b>${c.users}</b><span class="muted">users</span></div>
-				<div class="card"><b>${c.seats}</b><span class="muted">billable seats</span></div>
-			</div>
-			<h2>Keys expiring within ${days} days</h2>
-			${soon.length ? `<div class="wrap"><table><thead><tr><th>Device</th><th class="opt">User</th><th>Expires</th></tr></thead><tbody>
-				${soon.map((d) => `<tr><td>${esc(short(d.name))}</td><td class="opt">${esc(d.user_login)}</td>
-					<td class="${new Date(d.expires) < Date.now() ? "danger" : "warn"}">${esc(ago(d.expires))}</td></tr>`).join("")}
-			</tbody></table></div>` : `<p class="muted">None.</p>`}
-			${st.settings.billing_enabled ? `<h2>Billing ${esc(st.period)}</h2><p>${st.period_charge
-				? `Recorded: ${esc(money(st.period_charge.total_cents, st.period_charge.currency))} (${esc(st.period_charge.status)})`
-				: `<span class="warn">Not recorded yet.</span> <button class="link" id="goBilling">Record it</button>`}</p>` : ""}
-			<p class="muted small"><a href="https://login.tailscale.com/admin/machines" target="_blank" rel="noopener">Open the Tailscale admin console ↗</a></p>`;
-		$("#goBilling")?.addEventListener("click", () => show("billing"));
+		const card = (n, label, cls) => h("div", { class: "card" }, h("b", { class: cls }, n), h("span", { class: "muted" }, label));
+		replace(el,
+			st.problems.map((p) => msg("warn", ...settingsHint(p))),
+			ls?.ok === false && msg("danger", ls.error),
+			ls?.warning && msg("warn", ls.warning),
+			h("div", { class: "cards" },
+				card(c.devices, "devices"), card(c.online, "online", "ok"), card(c.expiring, "keys expiring", c.expiring ? "warn" : ""),
+				card(c.updates, "updates available"), card(c.users, "users"), card(c.seats, "billable seats")),
+			h("h2", null, `Keys expiring within ${days} days`),
+			soon.length ? table([["Device"], ["User", "opt"], ["Expires"]], soon.map((d) => h("tr", null,
+				h("td", null, short(d.name)), h("td", { class: "opt" }, d.user_login),
+				h("td", { class: new Date(d.expires) < Date.now() ? "danger" : "warn" }, ago(d.expires)))), "")
+				: h("p", { class: "muted" }, "None."),
+			st.settings.billing_enabled && [h("h2", null, `Billing ${st.period}`), h("p", null, st.period_charge
+				? `Recorded: ${money(st.period_charge.total_cents, st.period_charge.currency)} (${st.period_charge.status})`
+				: [h("span", { class: "warn" }, "Not recorded yet. "), h("button", { class: "link", onclick: () => show("billing") }, "Record it")])],
+			h("p", { class: "muted small" }, ext("https://login.tailscale.com/admin/machines", "Open the Tailscale admin console ↗")));
 	},
 
 	async devices(el) {
 		const devices = await api("/devices");
 		const days = state.status.settings.key_expiry_warn_days;
-		el.innerHTML = `<div class="toolbar"><input id="filter" type="search" placeholder="Filter by name, user, OS, IP, tag" value="${esc(state.filter)}"></div>
-			<div class="wrap"><table><thead><tr><th>Device</th><th class="opt">User</th><th class="opt">OS</th><th class="opt">Address</th><th>Last seen</th><th class="opt">Key expiry</th></tr></thead>
-			<tbody id="rows"></tbody></table></div><p class="muted small" id="count"></p>`;
+		const tbody = h("tbody"), count = h("p", { class: "muted small" });
 		const render = () => {
 			const f = state.filter.toLowerCase();
 			const list = devices.filter((d) => !f || [d.name, d.hostname, d.user_login, d.os, d.client_version, ...d.addresses, ...d.tags]
 				.some((v) => String(v || "").toLowerCase().includes(f)));
-			$("#rows").innerHTML = list.map((d) => {
+			replace(tbody, list.length ? list.map((d) => {
 				const exp = d.expires ? new Date(d.expires) : null;
 				const expCls = exp && exp < Date.now() ? "danger" : exp && exp < Date.now() + days * 864e5 ? "warn" : "";
-				return `<tr>
-					<td>${esc(short(d.name))}
-						${!d.authorized ? `<span class="badge warn">needs approval</span>` : ""}
-						${d.is_external ? `<span class="badge">shared in</span>` : ""}
-						${d.update_available ? `<span class="badge">update</span>` : ""}
-						${d.tags.map((t) => `<span class="badge muted">${esc(t)}</span>`).join("")}</td>
-					<td class="opt">${esc(d.user_login)}</td>
-					<td class="opt">${esc(d.os)} <span class="muted small">${esc((d.client_version || "").split("-")[0])}</span></td>
-					<td class="opt">${esc(d.addresses[0] || "")}</td>
-					<td>${d.connected ? `<span class="ok">● online</span>` : esc(ago(d.last_seen))}</td>
-					<td class="opt ${expCls}">${d.key_expiry_disabled ? `<span class="muted">disabled</span>` : exp ? esc(ago(d.expires)) : "—"}</td>
-				</tr>`;
-			}).join("") || `<tr><td colspan="6" class="muted">No devices.</td></tr>`;
-			$("#count").textContent = `${list.length} of ${devices.length} devices`;
+				return h("tr", null,
+					h("td", null, short(d.name), " ",
+						!d.authorized && badge("needs approval", "warn"), d.is_external && badge("shared in"),
+						d.update_available && badge("update"), d.tags.map((t) => badge(t, "muted"))),
+					h("td", { class: "opt" }, d.user_login),
+					h("td", { class: "opt" }, d.os, " ", h("span", { class: "muted small" }, (d.client_version || "").split("-")[0])),
+					h("td", { class: "opt" }, d.addresses[0] || ""),
+					h("td", null, d.connected ? h("span", { class: "ok" }, "● online") : ago(d.last_seen)),
+					h("td", { class: `opt ${expCls}` }, d.key_expiry_disabled ? h("span", { class: "muted" }, "disabled") : exp ? ago(d.expires) : "—"));
+			}) : h("tr", null, h("td", { colspan: 6, class: "muted" }, "No devices.")));
+			count.textContent = `${list.length} of ${devices.length} devices`;
 		};
-		$("#filter").oninput = (e) => { state.filter = e.target.value; render(); };
+		replace(el,
+			h("div", { class: "toolbar" }, h("input", { type: "search", placeholder: "Filter by name, user, OS, IP, tag", value: state.filter,
+				oninput: (e) => { state.filter = e.target.value; render(); } })),
+			h("div", { class: "wrap" }, h("table", null, h("thead", null, h("tr", null,
+				h("th", null, "Device"), h("th", { class: "opt" }, "User"), h("th", { class: "opt" }, "OS"),
+				h("th", { class: "opt" }, "Address"), h("th", null, "Last seen"), h("th", { class: "opt" }, "Key expiry"))), tbody)),
+			count);
 		render();
 	},
 
 	async users(el) {
 		const users = await api("/users");
 		const cls = { active: "ok", idle: "muted", suspended: "danger", "needs-approval": "warn" };
-		el.innerHTML = users.length ? `<div class="wrap"><table><thead><tr><th>User</th><th class="opt">Role</th><th>Status</th><th class="num">Devices</th><th class="opt">Last seen</th></tr></thead><tbody>
-			${users.map((u) => `<tr>
-				<td>${esc(u.display_name || u.login_name)}<div class="muted small">${esc(u.login_name)}</div></td>
-				<td class="opt">${esc(u.role)}${u.type === "shared" ? ` <span class="badge">shared</span>` : ""}</td>
-				<td><span class="badge ${cls[u.status] || ""}">${esc(u.status)}</span>${u.type === "member" && u.status === "active" ? ` <span class="badge muted">billable</span>` : ""}</td>
-				<td class="num">${esc(u.device_count ?? "")}</td>
-				<td class="opt">${u.connected ? `<span class="ok">● online</span>` : esc(ago(u.last_seen))}</td>
-			</tr>`).join("")}
-		</tbody></table></div>
-		<p class="muted small">Billable seats = members with status "active". Shared-in users and idle or suspended members are not counted.</p>`
-			: `<p class="muted">No users synced. ${esc(state.status.last_sync?.warning || "")}</p>`;
+		if (!users.length) {
+			replace(el, h("p", { class: "muted" }, "No users synced. ", state.status.last_sync?.warning || ""));
+			return;
+		}
+		replace(el,
+			table([["User"], ["Role", "opt"], ["Status"], ["Devices", "num"], ["Last seen", "opt"]], users.map((u) => h("tr", null,
+				h("td", null, u.display_name || u.login_name, h("div", { class: "muted small" }, u.login_name)),
+				h("td", { class: "opt" }, u.role, u.type === "shared" && [" ", badge("shared")]),
+				h("td", null, badge(u.status, cls[u.status] || ""), u.type === "member" && u.status === "active" && [" ", badge("billable", "muted")]),
+				h("td", { class: "num" }, u.device_count ?? ""),
+				h("td", { class: "opt" }, u.connected ? h("span", { class: "ok" }, "● online") : ago(u.last_seen)))), ""),
+			h("p", { class: "muted small" }, "Billable seats = members with status “active”. Shared-in users and idle or suspended members are not counted."));
 	},
 
 	async billing(el) {
 		const st = state.status, s = st.settings;
 		const charges = await api("/charges");
-		const history = `<h2>History</h2>${charges.length ? `<div class="wrap"><table><thead><tr><th>Month</th><th class="num opt">Seats</th><th class="num">Total</th><th>Status</th><th class="opt">Entry</th><th></th></tr></thead><tbody>
-			${charges.map((c) => `<tr>
-				<td>${esc(c.period)}<div class="muted small">${esc(c.entry_date)}</div></td>
-				<td class="num opt">${esc(c.seats)}</td>
-				<td class="num">${esc(money(c.total_cents, c.currency))}</td>
-				<td><span class="badge ${c.status === "posted" ? "ok" : c.status === "reversed" ? "muted" : "warn"}">${esc(c.status)}</span></td>
-				<td class="opt">${c.entry_id ? `#${esc(c.entry_id)}` : ""}${c.reversal_entry_id ? ` → #${esc(c.reversal_entry_id)}` : ""}</td>
-				<td>${c.status === "posted" ? `<button class="link" data-reverse="${esc(c.id)}">Reverse</button>`
-					: c.status === "pending" ? `<button class="link" data-discard="${esc(c.id)}">Discard</button>` : ""}</td>
-			</tr>`).join("")}</tbody></table></div>` : `<p class="muted">No charges recorded yet.</p>`}`;
+		const canPost = st.role !== "viewer";
+		const history = [h("h2", null, "History"), charges.length
+			? table([["Month"], ["Seats", "num opt"], ["Total", "num"], ["Status"], ["Entry", "opt"], [""]], charges.map((c) => h("tr", null,
+				h("td", null, c.period, h("div", { class: "muted small" }, c.entry_date)),
+				h("td", { class: "num opt" }, c.seats),
+				h("td", { class: "num" }, money(c.total_cents, c.currency)),
+				h("td", null, badge(c.status, c.status === "posted" ? "ok" : c.status === "reversed" ? "muted" : "warn")),
+				h("td", { class: "opt" }, c.entry_id ? `#${c.entry_id}` : "", c.reversal_entry_id ? ` → #${c.reversal_entry_id}` : ""),
+				h("td", null, canPost && c.status === "posted" && h("button", { class: "link", async onclick() {
+					if (!confirm("Post a reversing journal entry for this charge?")) return;
+					try { await api(`/charges/${c.id}/reverse`, { method: "POST", body: "{}" }); flash("Charge reversed.", "ok"); await refresh(); }
+					catch (err) { flash(err.message); }
+				} }, "Reverse"),
+				canPost && c.status === "pending" && h("button", { class: "link", async onclick() {
+					if (!confirm("Discard this pending charge? First check the journal for an entry with reference tailscale:<month>; if one exists, reverse it in Ledger.")) return;
+					try { await api(`/charges/${c.id}`, { method: "DELETE" }); await refresh(); }
+					catch (err) { flash(err.message); }
+				} }, "Discard")))), "")
+			: h("p", { class: "muted" }, "No charges recorded yet.")];
 
 		if (!s.billing_enabled) {
-			el.innerHTML = `<p>Billing is off. Turn it on under <button class="link" id="goSettings">Settings</button> to record the monthly
-				Tailscale subscription as a journal entry.</p>${history}`;
-			$("#goSettings").onclick = () => show("settings");
-		} else {
-			el.innerHTML = `<form id="chargeForm">
-				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px 14px">
-					<label>Month <input name="period" type="month" required value="${esc(st.period)}"></label>
-					<label>Entry date <input name="entry_date" type="date" required value="${esc(st.today)}"></label>
-					<label>Seats <input name="seats" type="number" min="0" max="100000" step="1" required value="${esc(st.counts.seats)}"></label>
-					<label>Memo (optional) <input name="memo" maxlength="200"></label>
-				</div>
-				<p class="preview" id="preview"></p>
-				<p class="muted small">Debit ${esc(s.expense_account)} · Credit ${esc(s.payment_account)} · reference tailscale:&lt;month&gt;</p>
-				<button class="primary" id="postBtn">Post charge</button>
-			</form>${history}`;
-			const f = $("#chargeForm");
-			const preview = () => {
-				const seats = Math.max(0, Math.trunc(Number(f.seats.value) || 0));
-				const total = seats * Number(s.price_per_user_cents) + Number(s.base_fee_cents);
-				$("#preview").innerHTML = `${seats} × ${esc(money(s.price_per_user_cents, s.currency))}${Number(s.base_fee_cents)
-					? ` + ${esc(money(s.base_fee_cents, s.currency))}` : ""} = <b>${esc(money(total, s.currency))}</b>`;
-			};
-			f.seats.oninput = preview;
-			preview();
-			f.onsubmit = async (e) => {
-				e.preventDefault();
-				$("#postBtn").disabled = true;
-				try {
-					const c = await api("/charges", { method: "POST", body: JSON.stringify({
-						period: f.period.value, entry_date: f.entry_date.value, seats: Number(f.seats.value), memo: f.memo.value || null }) });
-					flash(`Posted journal entry #${c.entry_id} for ${money(c.total_cents, c.currency)}.`, "ok");
-					await refresh();
-				} catch (err) { flash(err.message); $("#postBtn").disabled = false; }
-			};
+			replace(el, h("p", null, ...settingsHint("To record the monthly Tailscale subscription as a journal entry, turn on billing")), history);
+			return;
 		}
-		el.querySelectorAll("[data-reverse]").forEach((b) => b.onclick = async () => {
-			if (!confirm("Post a reversing journal entry for this charge?")) return;
-			try { await api(`/charges/${b.dataset.reverse}/reverse`, { method: "POST", body: "{}" }); flash("Charge reversed.", "ok"); await refresh(); }
-			catch (err) { flash(err.message); }
-		});
-		el.querySelectorAll("[data-discard]").forEach((b) => b.onclick = async () => {
-			if (!confirm("Discard this pending charge? First check the journal for an entry with reference tailscale:<month>; if one exists, reverse it in Ledger.")) return;
-			try { await api(`/charges/${b.dataset.discard}`, { method: "DELETE" }); await refresh(); }
-			catch (err) { flash(err.message); }
-		});
-	},
-
-	async settings(el) {
-		const s = await api("/settings");
-		const accounts = await api("/accounts").catch(() => []);
-		const opts = (types, cur, sel) => `<option value="">— choose —</option>` + accounts
-			.filter((a) => a.is_active && types.includes(a.type) && (a.currency === cur || a.code === sel))
-			.map((a) => `<option value="${esc(a.code)}" ${a.code === sel ? "selected" : ""}>${esc(a.code)} · ${esc(a.name)} (${esc(a.currency)})</option>`).join("");
-		const secretHint = (set, h) => set ? `<span class="muted small">saved: ${esc(h)} — leave blank to keep</span>` : "";
-		el.innerHTML = `<form id="sf">
-			<fieldset><legend>Connection</legend><div class="grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px 14px">
-				<label>Tailnet <input name="tailnet" value="${esc(s.tailnet)}" placeholder="-"><span class="muted small">"-" = the key's own tailnet</span></label>
-				<label>Authentication <select name="auth_mode">
-					<option value="api_key" ${s.auth_mode === "api_key" ? "selected" : ""}>API access token</option>
-					<option value="oauth" ${s.auth_mode === "oauth" ? "selected" : ""}>OAuth client (recommended)</option></select></label>
-				<label data-mode="api_key">API access token <input name="api_key" type="password" autocomplete="off" placeholder="tskey-api-…">${secretHint(s.api_key_set, s.api_key_hint)}</label>
-				<label data-mode="oauth">OAuth client ID <input name="oauth_client_id" autocomplete="off" value="${esc(s.oauth_client_id)}"></label>
-				<label data-mode="oauth">OAuth client secret <input name="oauth_client_secret" type="password" autocomplete="off" placeholder="tskey-client-…">${secretHint(s.oauth_client_secret_set, s.oauth_client_secret_hint)}</label>
-			</div>
-			<p class="muted small">Read-only scopes are enough: <code>devices:core:read</code> and <code>users:read</code>. Secrets are stored in Ledger's database and never shown again.</p>
-			<div class="row"><button type="button" class="link" id="clearSecrets">Remove saved credentials</button></div></fieldset>
-
-			<fieldset><legend>Sync and alerts</legend><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 14px">
-				<label>Sync every (minutes, 0 = off) <input name="sync_minutes" type="number" min="0" max="1440" value="${esc(s.sync_minutes)}"></label>
-				<label>Warn of key expiry (days) <input name="key_expiry_warn_days" type="number" min="1" max="90" value="${esc(s.key_expiry_warn_days)}"></label>
-				<label>Warn when offline (days, 0 = off) <input name="offline_warn_days" type="number" min="0" max="365" value="${esc(s.offline_warn_days)}"></label>
-			</div></fieldset>
-
-			<fieldset><legend>Billing</legend>
-				<label class="check"><input type="checkbox" name="billing_enabled" ${s.billing_enabled ? "checked" : ""}> Record the monthly subscription in the ledger</label>
-				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 14px;margin-top:10px">
-					<label>Price per user / month <input name="price" inputmode="decimal" value="${esc(centsToInput(s.price_per_user_cents))}"></label>
-					<label>Flat fee / month <input name="base_fee" inputmode="decimal" value="${esc(centsToInput(s.base_fee_cents))}"></label>
-					<label>Currency <select name="currency">${["USD", "CAD"].map((c) => `<option ${c === s.currency ? "selected" : ""}>${c}</option>`).join("")}</select></label>
-					<label>Remind me on day <input name="bill_day" type="number" min="1" max="28" value="${esc(s.bill_day)}"></label>
-					<label>Expense account (debit) <select name="expense_account"></select></label>
-					<label>Paid from (credit) <select name="payment_account"></select></label>
-				</div>
-			</fieldset>
-			<div class="row"><button class="primary" id="saveBtn">Save</button><span class="muted small">${s.updated_by ? `Last changed by ${esc(s.updated_by)} ${esc(ago(s.updated_at))}` : ""}</span></div>
-		</form>`;
-		const f = $("#sf");
-		const syncMode = () => el.querySelectorAll("[data-mode]").forEach((l) => l.hidden = l.dataset.mode !== f.auth_mode.value);
-		const syncAccounts = () => {
-			f.expense_account.innerHTML = opts(["expense"], f.currency.value, f.expense_account.value || s.expense_account);
-			f.payment_account.innerHTML = opts(["asset", "liability"], f.currency.value, f.payment_account.value || s.payment_account);
-		};
-		f.auth_mode.onchange = syncMode;
-		f.currency.onchange = syncAccounts;
-		syncMode(); syncAccounts();
-		if (!accounts.length) flash("Could not load accounts from Ledger.");
-
-		const save = async (extra = {}) => {
-			const price = toCents(f.price.value), base = toCents(f.base_fee.value);
-			if (price === null || base === null) throw new Error("Enter prices like 6.00");
-			const body = {
-				tailnet: f.tailnet.value.trim() || "-", auth_mode: f.auth_mode.value,
-				oauth_client_id: f.oauth_client_id.value.trim() || null,
-				sync_minutes: Number(f.sync_minutes.value), key_expiry_warn_days: Number(f.key_expiry_warn_days.value),
-				offline_warn_days: Number(f.offline_warn_days.value), billing_enabled: f.billing_enabled.checked,
-				price_per_user_cents: price, base_fee_cents: base, currency: f.currency.value, bill_day: Number(f.bill_day.value),
-				expense_account: f.expense_account.value || null, payment_account: f.payment_account.value || null, ...extra,
-			};
-			if (f.api_key.value.trim()) body.api_key = f.api_key.value.trim();
-			if (f.oauth_client_secret.value.trim()) body.oauth_client_secret = f.oauth_client_secret.value.trim();
-			const credsChanged = "api_key" in body || "oauth_client_secret" in body || body.tailnet !== s.tailnet
-				|| body.auth_mode !== s.auth_mode || body.oauth_client_id !== s.oauth_client_id;
-			await api("/settings", { method: "PUT", body: JSON.stringify(body) });
-			return credsChanged;
-		};
-		f.onsubmit = async (e) => {
+		if (st.billing_problems.length || !canPost) {
+			replace(el, st.billing_problems.map((p) => msg("warn", ...settingsHint(p))),
+				!canPost && h("p", { class: "muted" }, "Viewers can't post charges."), history);
+			return;
+		}
+		const preview = h("p", { class: "preview" });
+		const f = h("form", { async onsubmit(e) {
 			e.preventDefault();
-			$("#saveBtn").disabled = true;
+			const btn = f.querySelector("button");
+			btn.disabled = true;
 			try {
-				const credsChanged = await save();
-				await loadStatus();
-				if (credsChanged && state.status.configured) {
-					flash("Saved. Testing the connection…", "ok");
-					const r = await api("/sync", { method: "POST", body: "{}" });
-					flash(`Connected: ${r.device_count} devices${r.user_count != null ? `, ${r.user_count} users` : ""}.${r.warning ? " " + r.warning : ""}`, r.warning ? "warn" : "ok");
-				} else flash("Saved.", "ok");
+				const c = await api("/charges", { method: "POST", body: JSON.stringify({
+					period: f.period.value, entry_date: f.entry_date.value, seats: Number(f.seats.value), memo: f.memo.value || null }) });
+				flash(`Posted journal entry #${c.entry_id} for ${money(c.total_cents, c.currency)}.`, "ok");
 				await refresh();
-			} catch (err) { flash(err.message); await refresh().catch(() => {}); }
+			} catch (err) { flash(err.message); btn.disabled = false; }
+		} },
+			h("div", { class: "grid" },
+				h("label", null, "Month", h("input", { name: "period", type: "month", required: true, value: st.period })),
+				h("label", null, "Entry date", h("input", { name: "entry_date", type: "date", required: true, value: st.today })),
+				h("label", null, "Seats", h("input", { name: "seats", type: "number", min: 0, max: 100000, step: 1, required: true, value: st.counts.seats,
+					oninput: () => updatePreview() })),
+				h("label", null, "Memo (optional)", h("input", { name: "memo", maxLength: 200 }))),
+			preview,
+			h("p", { class: "muted small" }, `Debit ${s.expense_account} · Credit ${s.payment_account} · reference tailscale:<month>`),
+			h("button", { class: "primary" }, "Post charge"));
+		const updatePreview = () => {
+			const seats = Math.max(0, Math.trunc(Number(f.seats.value) || 0));
+			const total = seats * Number(s.price_per_user_cents) + Number(s.base_fee_cents);
+			replace(preview, `${seats} × ${money(s.price_per_user_cents, s.currency)}`,
+				Number(s.base_fee_cents) ? ` + ${money(s.base_fee_cents, s.currency)}` : "", " = ", h("b", null, money(total, s.currency)));
 		};
-		$("#clearSecrets").onclick = async () => {
-			if (!confirm("Remove the saved API token and OAuth client? Syncing stops until you add new ones.")) return;
-			try { await save({ api_key: null, oauth_client_id: null, oauth_client_secret: null }); flash("Credentials removed.", "ok"); await refresh(); }
-			catch (err) { flash(err.message); }
-		};
+		updatePreview();
+		replace(el, f, history);
 	},
 };
 
@@ -472,7 +417,7 @@ async function show(tab) {
 	document.querySelectorAll("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === state.tab)));
 	const el = $("#view");
 	try { await views[state.tab](el); }
-	catch (err) { el.innerHTML = ""; flash(err.message); }
+	catch (err) { el.replaceChildren(); flash(err.message); }
 }
 
 async function refresh() {
@@ -488,7 +433,7 @@ $("#syncBtn").onclick = async () => {
 		const r = await api("/sync", { method: "POST", body: "{}" });
 		flash(r.warning ? r.warning : "", "warn");
 	} catch (err) { flash(err.message); }
-	b.textContent = "Sync now";
+	b.disabled = false; b.textContent = "Sync now";
 	await refresh().catch((err) => flash(err.message));
 };
 refresh().catch((err) => flash(err.message));

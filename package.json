@@ -1,0 +1,8 @@
+{
+  "name": "ledger-module-tailscale",
+  "private": true,
+  "description": "Only for running tests; Ledger installs the module without npm.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

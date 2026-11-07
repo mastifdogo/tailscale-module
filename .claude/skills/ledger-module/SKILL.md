@@ -76,16 +76,20 @@ Shares Ledger on your tailnet with Tailscale Serve (through the server's own
 tailscaled LocalAPI socket), syncs tailnet devices and users, posts alerts to
 Ledger's dashboard, and books the Tailscale subscription.
 
-- Layout: everything is in `server.mjs` (LocalAPI client, Serve setup, sync,
-  charges) and `ui/index.html`. No test suite yet.
+- Layout: `server.mjs` (routes, LocalAPI client, sync, charges, settings
+  handling), `lib.mjs` (address detection, Serve config building, probes: no
+  Ledger or tailscaled needed) and `ui/index.html` (builds the DOM with an
+  `h()` helper; API data only ever goes in as text). Tests: `npm test`
+  (`node --test`, covers `lib.mjs`).
+- Configuration is the manifest's `settings` (Ledger's form under Settings →
+  Tailscale). The Access tab's Advanced options (address, HTTPS port, socket,
+  plain http) stay in `mod_tailscale.settings` because they go with the
+  share/stop actions. 0.1.0 copied older installs' values into the form once
+  (`moved_to_ledger_settings`).
 - It talks to `tailscaled` on the Ledger server; the checker can't exercise
-  those routes without one, so test Serve changes on a real container.
-  Changing what it shares changes how Ledger is reached: confirm with the
-  user before touching Serve defaults.
-- Known follow-ups:
-  - The checker warns that `ui/index.html` assigns `innerHTML`; make sure
-    device names, users and other API data go through `textContent`.
-  - Admin-only actions (Serve on/off, node login) should check
-    `req.user.role === "admin"` (Ledger ≥ 0.10.0).
-  - `nav.icon` is `box`; a drawn icon (Ledger ≥ 0.9.1) would fit better.
-  - Add tests (`node --test`) for the parts that don't need tailscaled.
+  those routes without one, so test Serve changes against a real tailscaled or
+  the stand-ins in `test/` (`withLedger`, `describeServe`). Changing what it
+  shares changes how Ledger is reached: confirm with the user before touching
+  Serve defaults.
+- Roles: sharing, stopping, node login and Access → Advanced are admin-only;
+  sync and charges are bookkeeper and up.

@@ -3,26 +3,29 @@
 // tailnet's devices and users from the Tailscale API, raises dashboard alerts
 // (expiring keys, offline machines, pending approvals, client updates) and
 // records the monthly subscription as a balanced journal entry.
+//
+// Configuration lives in Ledger's settings form for this module (manifest
+// "settings"), except the Serve options on the Access tab, which go with the
+// share/stop actions and are kept in mod_tailscale.settings.
 
-import fs from "node:fs";
 import http from "node:http";
-import https from "node:https";
-import net from "node:net";
 import os from "node:os";
+import {
+	SERVE_PORTS, REDIRECT_SINCE, ServeConflict, centsToText, describeServe, hostFor, httpProbe, isRealDate,
+	listNames, localDate, normalizeTarget, ownListeners, pad, serveUrl, shortName, toCents, versionAtLeast,
+	withLedger, withoutLedger,
+} from "./lib.mjs";
 
 const API = "https://api.tailscale.com/api/v2";
-const SERVE_PORTS = [443, 8443, 10000]; // the ports Tailscale Serve accepts for HTTPS
-const HTTP_PORT = 80;
-const REDIRECT_SINCE = [1, 92, 0]; // first tailscaled whose Serve handlers support Redirect
 const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
 const TIMEOUT_MS = 10_000;
 const LINK = "/apps/tailscale";
+const SETTINGS_LINK = "Settings → Tailscale";
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const KEY_RE = /^tskey-[A-Za-z0-9_-]{8,300}$/;
 const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,200}$/;
 const TAILNET_RE = /^[A-Za-z0-9._@-]{1,200}$/;
 const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Snapshot columns and their types for jsonb_to_recordset.
 const DEVICE_COLS = {
@@ -36,139 +39,11 @@ const USER_COLS = {
 	device_count: "int", last_seen: "timestamptz", connected: "boolean", created: "timestamptz",
 };
 
-const pad = (n) => String(n).padStart(2, "0");
-const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const isRealDate = (s) => DATE_RE.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
 // Tailscale uses 0001-01-01T00:00:00Z for "never".
 const ts = (v) => (typeof v === "string" && v && !v.startsWith("0001-") ? v : null);
 const str = (v) => (typeof v === "string" ? v : v == null ? null : String(v));
 const strList = (v) => (Array.isArray(v) ? v.map(String) : []);
-const listNames = (names, max = 8) =>
-	names.slice(0, max).join(", ") + (names.length > max ? ` and ${names.length - max} more` : "");
-const shortName = (n) => String(n).split(".")[0];
-
-// /proc/net/tcp{,6} address: little-endian 32-bit words of hex.
-function procAddr(hex) {
-	const bytes = hex.match(/../g).map((b) => parseInt(b, 16));
-	for (let i = 0; i < bytes.length; i += 4) bytes.splice(i, 4, ...bytes.slice(i, i + 4).reverse());
-	if (bytes.length === 4) return bytes.join(".");
-	const groups = [];
-	for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
-	const v6 = groups.join(":");
-	if (/^0:0:0:0:0:ffff:/.test(v6)) return bytes.slice(12).join("."); // IPv4-mapped
-	return v6 === "0:0:0:0:0:0:0:0" ? "::" : v6 === "0:0:0:0:0:0:0:1" ? "::1" : v6;
-}
-
-// TCP ports this very process (Ledger) listens on, read from /proc. [] where unavailable.
-function ownListeners() {
-	try {
-		const inodes = new Set();
-		for (const fd of fs.readdirSync("/proc/self/fd")) {
-			try {
-				const m = /^socket:\[(\d+)\]$/.exec(fs.readlinkSync(`/proc/self/fd/${fd}`));
-				if (m) inodes.add(m[1]);
-			} catch {}
-		}
-		const out = [];
-		for (const name of ["tcp", "tcp6"]) {
-			// /proc/self/net stays readable under systemd ProcSubset=pid, which hides /proc/net.
-			let text;
-			for (const file of [`/proc/self/net/${name}`, `/proc/net/${name}`]) {
-				try {
-					text = fs.readFileSync(file, "utf8");
-					break;
-				} catch {}
-			}
-			if (!text) continue;
-			for (const line of text.trim().split("\n").slice(1)) {
-				const c = line.trim().split(/\s+/);
-				if (c[3] !== "0A" || !inodes.has(c[9])) continue; // 0A = LISTEN
-				const [ip, port] = c[1].split(":");
-				out.push({ ip: procAddr(ip), port: parseInt(port, 16) });
-			}
-		}
-		return out;
-	} catch {
-		return [];
-	}
-}
-
-const hostFor = (ip) => (ip === "0.0.0.0" || ip === "::" ? "127.0.0.1" : ip.includes(":") ? `[${ip}]` : ip);
-
-// This machine's own addresses: Ledger may only be published from here.
-function ownAddresses() {
-	const set = new Set(["127.0.0.1", "::1", "localhost"]);
-	try {
-		for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) set.add(a.address.split("%")[0]);
-	} catch {} // throws under systemd RestrictAddressFamilies without AF_NETLINK: loopback only then
-	return set;
-}
-
-// Accepts "3000", "127.0.0.1:3000", "http://10.0.0.5:3000/", "https://localhost:8443", ...
-// Returns a Tailscale Serve proxy target, or null if it isn't an address on this machine.
-function normalizeTarget(input) {
-	let v = String(input).trim();
-	if (/^\d{1,5}$/.test(v)) v = `127.0.0.1:${v}`;
-	if (!/^[a-z]+:\/\//i.test(v)) v = `http://${v}`;
-	let u;
-	try {
-		u = new URL(v);
-	} catch {
-		return null;
-	}
-	if (!["http:", "https:"].includes(u.protocol) || u.username || u.password || u.search || u.hash) return null;
-	if (u.pathname !== "/" && u.pathname !== "") return null;
-	const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
-	let host = u.hostname.replace(/^\[|\]$/g, "");
-	if (host === "0.0.0.0" || host === "::") host = "127.0.0.1";
-	if (!ownAddresses().has(host) || port < 1 || port > 65535) return null;
-	const h = host.includes(":") ? `[${host}]` : host;
-	// Serve can't verify a local certificate, so HTTPS targets skip verification.
-	return `${u.protocol === "https:" ? "https+insecure" : "http"}://${h}:${port}`;
-}
-
-// Make one HTTP request to a Serve target, the way Tailscale Serve will.
-// Ledger answers an anonymous call to this module's API with its JSON error body,
-// which tells it apart from some other web server on that port.
-function httpProbe(target, moduleId) {
-	const u = new URL(target.replace(/^https\+insecure:/, "https:"));
-	const mod = u.protocol === "https:" ? https : http;
-	return new Promise((resolve) => {
-		const req = mod.request({
-			host: u.hostname.replace(/^\[|\]$/g, ""), port: u.port, method: "GET",
-			path: `/api/v1/m/${moduleId}/status`, rejectUnauthorized: false, headers: { Accept: "application/json" },
-		}, (res) => {
-			let body = "";
-			res.setEncoding("utf8");
-			res.on("data", (c) => {
-				if (body.length < 8192) body += c;
-			});
-			res.on("end", () => {
-				let ledger = false;
-				try {
-					ledger = typeof JSON.parse(body)?.error === "object";
-				} catch {}
-				resolve({ ok: true, status: res.statusCode, ledger });
-			});
-		});
-		req.setTimeout(3_000, () => req.destroy(Object.assign(new Error("no answer within 3 s"), { code: "ETIMEDOUT" })));
-		req.on("error", (e) => resolve({
-			ok: false,
-			reason: e.code === "ECONNREFUSED" ? "nothing is listening there"
-				: String(e.code ?? "").startsWith("HPE_") ? "what's listening there isn't a web server"
-				: e.code === "EPROTO" || /SSL|TLS/i.test(e.message) ? "it doesn't speak HTTPS (use http://)"
-				: e.message,
-		}));
-		req.end();
-	});
-}
-
-function versionAtLeast(version, min) {
-	const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
-	if (!m) return false;
-	for (let i = 0; i < 3; i++) if (Number(m[i + 1]) !== min[i]) return Number(m[i + 1]) > min[i];
-	return true;
-}
+const wholeNumber = (v, def, min, max) => (Number.isFinite(v) ? Math.min(max, Math.max(min, Math.trunc(v))) : def);
 
 /** @param {any} ctx */
 export default async function register(ctx) {
@@ -177,6 +52,7 @@ export default async function register(ctx) {
 	const route = ctx.route.bind(ctx);
 	ctx = Object.create(ctx, {
 		route: {
+			// Unexpected errors keep their cause instead of Ledger's bare "internal server error".
 			value: (method, path, handler) => route(method, path, async (req) => {
 				try {
 					return await handler(req);
@@ -188,26 +64,14 @@ export default async function register(ctx) {
 			}),
 		},
 	});
+	const requireAdmin = (req, what) => {
+		if (req.user.role !== "admin") throw new ctx.HttpError(403, `Only an admin can ${what}`);
+	};
 	/** @type {{ value: string, exp: number, clientId: string } | null} */
 	let oauthToken = null;
 	/** @type {Promise<any> | null} */
 	let running = null;
 	let lastBillingCheck = 0;
-
-	const getSettings = async () => (await ctx.db.query(`SELECT * FROM ${S}.settings WHERE id`)).rows[0];
-	const isConfigured = (s) =>
-		s.auth_mode === "api_key" ? !!s.api_key : !!(s.oauth_client_id && s.oauth_client_secret);
-	const hint = (v) => (v ? `••••${v.slice(-4)}` : null);
-
-	// Settings as returned to the browser: secrets replaced by a hint.
-	function publicSettings(s) {
-		const { api_key, oauth_client_secret, id, ...rest } = s;
-		return {
-			...rest,
-			api_key_set: !!api_key, api_key_hint: hint(api_key),
-			oauth_client_secret_set: !!oauth_client_secret, oauth_client_secret_hint: hint(oauth_client_secret),
-		};
-	}
 
 	// Run a dashboard call without letting a failure there break the caller.
 	async function safe(fn) {
@@ -218,14 +82,142 @@ export default async function register(ctx) {
 		}
 	}
 
+	// ---------------------------------------------------------------- settings
+
+	/**
+	 * Everything the module is configured with: the values from Ledger's
+	 * settings form, made safe to use, plus the Serve options. `problems` says
+	 * what in the form needs fixing.
+	 */
+	async function getSettings() {
+		const [v, { rows: [local] }] = await Promise.all([
+			ctx.settings.get(),
+			ctx.db.query(`SELECT socket_path, serve_target, serve_port, serve_http, serve_wanted FROM ${S}.settings WHERE id`),
+		]);
+		const problems = [];
+		const text = (k) => (typeof v[k] === "string" ? v[k].trim() : "");
+		let tailnet = text("tailnet") || "-";
+		if (!TAILNET_RE.test(tailnet)) {
+			problems.push(`Tailnet "${tailnet.slice(0, 60)}" isn't a tailnet name: use "-" for the credentials' own tailnet`);
+			tailnet = "-";
+		}
+		const s = {
+			...local,
+			tailnet,
+			auth_mode: v.auth_mode === "api_key" ? "api_key" : "oauth",
+			api_key: text("api_key") || null,
+			oauth_client_id: text("oauth_client_id") || null,
+			oauth_client_secret: text("oauth_client_secret") || null,
+			sync_minutes: wholeNumber(v.sync_minutes, 60, 0, 1440),
+			key_expiry_warn_days: wholeNumber(v.key_expiry_warn_days, 14, 1, 90),
+			offline_warn_days: wholeNumber(v.offline_warn_days, 30, 0, 365),
+			billing_enabled: v.billing_enabled === true,
+			price_per_user_cents: toCents(text("price_per_user") || "0"),
+			base_fee_cents: toCents(text("base_fee") || "0"),
+			currency: v.currency === "CAD" ? "CAD" : "USD",
+			expense_account: text("expense_account") || null,
+			payment_account: text("payment_account") || null,
+			bill_day: wholeNumber(v.bill_day, 1, 1, 28),
+			problems,
+		};
+		if (s.sync_minutes > 0 && s.sync_minutes < 5) s.sync_minutes = 5;
+		if (s.auth_mode === "api_key" && s.api_key && !KEY_RE.test(s.api_key)) {
+			problems.push("The API access token doesn't look like a Tailscale key (tskey-api-…)");
+		}
+		if (s.auth_mode === "oauth" && s.oauth_client_secret && !KEY_RE.test(s.oauth_client_secret)) {
+			problems.push("The OAuth client secret doesn't look like a Tailscale key (tskey-client-…)");
+		}
+		if (s.oauth_client_id && !CLIENT_ID_RE.test(s.oauth_client_id)) problems.push("The OAuth client ID has unexpected characters");
+		if (s.price_per_user_cents === null) problems.push(`Price per user "${text("price_per_user")}" isn't an amount like 6.00`);
+		if (s.base_fee_cents === null) problems.push(`Flat fee "${text("base_fee")}" isn't an amount like 0.00`);
+		return s;
+	}
+
+	const isConfigured = (s) =>
+		s.auth_mode === "api_key" ? !!s.api_key : !!(s.oauth_client_id && s.oauth_client_secret);
+
+	// Why billing can't post right now, or [] when it can.
+	async function billingProblems(s) {
+		if (!s.billing_enabled) return [];
+		const out = [];
+		if (s.price_per_user_cents === null || s.base_fee_cents === null) out.push("Fix the prices");
+		for (const [code, types, label] of [
+			[s.expense_account, ["expense"], "Expense"],
+			[s.payment_account, ["asset", "liability"], "Payment"],
+		]) {
+			if (!code) out.push(`Set the ${label.toLowerCase()} account`);
+			else if (!CODE_RE.test(code)) out.push(`${label} account "${code.slice(0, 40)}" isn't an account code`);
+			else await checkAccount(code, s.currency, types, label).catch((e) => out.push(e.message));
+		}
+		if (s.expense_account && s.expense_account === s.payment_account) out.push("Expense and payment accounts must differ");
+		return out;
+	}
+
+	async function checkAccount(code, currency, types, label) {
+		const a = await ctx.ledger.getAccount(code).catch(() => null);
+		if (!a) throw bad(`${label} account ${code} does not exist`);
+		if (!a.is_active) throw bad(`${label} account ${code} is inactive`);
+		if (a.currency !== currency) throw bad(`${label} account ${code} is in ${a.currency}, not ${currency}`);
+		if (!types.includes(a.type)) throw bad(`${label} account ${code} must be of type ${types.join(" or ")}`);
+		return a;
+	}
+
+	// Before 0.1.0 the module kept its configuration in its own table; copy it
+	// into Ledger's settings form once, then forget the secrets kept there.
+	async function moveOldSettings() {
+		const { rows: [old] } = await ctx.db.query(`SELECT * FROM ${S}.settings WHERE id AND NOT moved_to_ledger_settings`);
+		if (!old) return;
+		const hadCredentials = !!(old.api_key || old.oauth_client_id || old.oauth_client_secret);
+		const values = {
+			tailnet: old.tailnet,
+			auth_mode: hadCredentials ? old.auth_mode : undefined,
+			api_key: old.api_key ?? undefined,
+			oauth_client_id: old.oauth_client_id ?? undefined,
+			oauth_client_secret: old.oauth_client_secret ?? undefined,
+			sync_minutes: old.sync_minutes,
+			key_expiry_warn_days: old.key_expiry_warn_days,
+			offline_warn_days: old.offline_warn_days,
+			billing_enabled: old.billing_enabled,
+			price_per_user: centsToText(old.price_per_user_cents),
+			base_fee: centsToText(old.base_fee_cents),
+			currency: old.currency,
+			expense_account: old.expense_account ?? undefined,
+			payment_account: old.payment_account ?? undefined,
+			bill_day: old.bill_day,
+		};
+		for (const k of Object.keys(values)) if (values[k] === undefined) delete values[k];
+		await ctx.settings.set(values);
+		await ctx.db.query(
+			`UPDATE ${S}.settings SET moved_to_ledger_settings = true, api_key = NULL, oauth_client_secret = NULL WHERE id`);
+		ctx.log.info("tailscale settings moved to Ledger's settings form", { credentials: hadCredentials });
+	}
+	try {
+		await moveOldSettings();
+	} catch (e) {
+		ctx.log.error("could not move tailscale settings; will retry at next start", { error: String(e?.message ?? e) });
+	}
+
+	// Saving the form: use new credentials right away, and recheck billing.
+	ctx.settings.onChange(() => {
+		oauthToken = null;
+		lastBillingCheck = 0;
+		setTimeout(() => {
+			getSettings()
+				.then((s) => (isConfigured(s) ? sync("settings").catch(() => {}) : null))
+				.finally(runTick);
+		}, 1_000).unref();
+	});
+
 	// ---------------------------------------------------------------- Tailscale API
 
 	async function authorization(s) {
 		if (s.auth_mode === "api_key") {
-			if (!s.api_key) throw bad("No Tailscale API key is configured");
+			if (!s.api_key) throw new ctx.HttpError(409, `Add a Tailscale API access token under ${SETTINGS_LINK}`);
 			return `Bearer ${s.api_key}`;
 		}
-		if (!s.oauth_client_id || !s.oauth_client_secret) throw bad("OAuth client ID and secret are required");
+		if (!s.oauth_client_id || !s.oauth_client_secret) {
+			throw new ctx.HttpError(409, `Add the Tailscale OAuth client ID and secret under ${SETTINGS_LINK}`);
+		}
 		if (oauthToken && oauthToken.clientId === s.oauth_client_id && oauthToken.exp > Date.now() + 60_000) {
 			return `Bearer ${oauthToken.value}`;
 		}
@@ -326,7 +318,7 @@ export default async function register(ctx) {
 
 	async function doSync(triggeredBy) {
 		const s = await getSettings();
-		if (!isConfigured(s)) throw bad("Tailscale credentials are not configured");
+		if (!isConfigured(s)) throw new ctx.HttpError(409, `Add Tailscale API credentials under ${SETTINGS_LINK}`);
 		const { rows: [run] } = await ctx.db.query(
 			`INSERT INTO ${S}.syncs (triggered_by) VALUES ($1) RETURNING id`, [triggeredBy]);
 		try {
@@ -360,7 +352,7 @@ export default async function register(ctx) {
 			await safe(() => ctx.dashboard.notify({
 				key: "sync-error", title: "Tailscale sync failed", body: message, level: "danger", link: LINK,
 			}));
-			throw new ctx.HttpError(502, message);
+			throw e instanceof ctx.HttpError ? e : new ctx.HttpError(502, message);
 		}
 	}
 
@@ -427,40 +419,15 @@ export default async function register(ctx) {
 		}));
 	}
 
-	async function checkAccount(code, currency, types, label) {
-		const a = await ctx.ledger.getAccount(code).catch(() => null);
-		if (!a) throw bad(`${label} account ${code} does not exist`);
-		if (!a.is_active) throw bad(`${label} account ${code} is inactive`);
-		if (a.currency !== currency) throw bad(`${label} account ${code} is in ${a.currency}, not ${currency}`);
-		if (!types.includes(a.type)) throw bad(`${label} account ${code} must be of type ${types.join(" or ")}`);
-		return a;
-	}
-
-	// ---------------------------------------------------------------- validation
-
 	function intField(v, name, min, max) {
 		const n = (typeof v === "string" && /^\d+$/.test(v.trim())) || typeof v === "bigint" ? Number(v) : v;
 		if (!Number.isSafeInteger(n) || n < min || n > max) throw bad(`${name} must be a whole number from ${min} to ${max}`);
 		return n;
 	}
 
-	// undefined → keep, null/"" → clear, string → set.
-	function secretField(v, current, name, re) {
-		if (v === undefined) return current;
-		if (v === null || v === "") return null;
-		if (typeof v !== "string" || !re.test(v.trim())) throw bad(`${name} is not in the expected format`);
-		return v.trim();
-	}
-
-	function accountField(v, name) {
-		if (v === null || v === "" || v === undefined) return null;
-		if (typeof v !== "string" || !CODE_RE.test(v)) throw bad(`${name} is not a valid account code`);
-		return v;
-	}
-
 	// ---------------------------------------------------------------- routes
 
-	ctx.route("GET", "/status", async () => {
+	ctx.route("GET", "/status", async (req) => {
 		const s = await getSettings();
 		const { rows: [counts] } = await ctx.db.query(`
 			SELECT count(*)::int AS devices,
@@ -470,17 +437,23 @@ export default async function register(ctx) {
 			       count(*) FILTER (WHERE NOT authorized)::int AS unauthorized
 			FROM ${S}.devices`, [s.key_expiry_warn_days]);
 		const { rows: [lastSync] } = await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 1`);
-		const { rows: [lastOk] } = await ctx.db.query(
-			`SELECT finished_at FROM ${S}.syncs WHERE ok ORDER BY id DESC LIMIT 1`);
 		const period = localDate().slice(0, 7);
 		const { rows: [charge] } = await ctx.db.query(
 			`SELECT * FROM ${S}.charges WHERE period = $1 AND status <> 'reversed'`, [period]);
 		return {
+			role: req.user.role,
 			configured: isConfigured(s),
 			syncing: !!running,
-			settings: publicSettings(s),
+			// No secrets: only whether they're set.
+			settings: {
+				tailnet: s.tailnet, auth_mode: s.auth_mode, sync_minutes: s.sync_minutes,
+				key_expiry_warn_days: s.key_expiry_warn_days, offline_warn_days: s.offline_warn_days,
+				billing_enabled: s.billing_enabled, price_per_user_cents: s.price_per_user_cents, base_fee_cents: s.base_fee_cents,
+				currency: s.currency, expense_account: s.expense_account, payment_account: s.payment_account, bill_day: s.bill_day,
+			},
+			problems: s.problems,
+			billing_problems: await billingProblems(s),
 			last_sync: lastSync ?? null,
-			last_ok_sync_at: lastOk?.finished_at ?? null,
 			counts: { ...counts, ...(await billableSeats()) },
 			period,
 			today: localDate(),
@@ -499,71 +472,15 @@ export default async function register(ctx) {
 	ctx.route("GET", "/syncs", async () =>
 		(await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 20`)).rows);
 
-	ctx.route("GET", "/accounts", async () =>
-		(await ctx.ledger.listAccounts()).map(({ code, name, type, currency, is_active }) =>
-			({ code, name, type, currency, is_active })));
-
-	ctx.route("GET", "/settings", async () => publicSettings(await getSettings()));
-
-	ctx.route("PUT", "/settings", async (req) => {
-		const b = req.body;
-		if (!b || typeof b !== "object" || Array.isArray(b)) throw bad("Send the settings as a JSON object");
-		const cur = await getSettings();
-		const pick = (k) => (b[k] === undefined ? cur[k] : b[k]);
-
-		const tailnet = String(pick("tailnet") ?? "").trim() || "-";
-		if (!TAILNET_RE.test(tailnet)) throw bad("tailnet must be '-' or your tailnet name (letters, digits, . _ @ -)");
-		const auth_mode = pick("auth_mode");
-		if (!["api_key", "oauth"].includes(auth_mode)) throw bad("auth_mode must be api_key or oauth");
-		const api_key = secretField(b.api_key, cur.api_key, "API key", KEY_RE);
-		const oauth_client_secret = secretField(b.oauth_client_secret, cur.oauth_client_secret, "OAuth client secret", KEY_RE);
-		const oauth_client_id = secretField(b.oauth_client_id, cur.oauth_client_id, "OAuth client ID", CLIENT_ID_RE);
-
-		const sync_minutes = intField(pick("sync_minutes"), "Sync interval", 0, 1440);
-		if (sync_minutes > 0 && sync_minutes < 5) throw bad("Sync interval must be 0 (off) or at least 5 minutes");
-		const key_expiry_warn_days = intField(pick("key_expiry_warn_days"), "Key expiry warning", 1, 90);
-		const offline_warn_days = intField(pick("offline_warn_days"), "Offline warning", 0, 365);
-
-		const billing_enabled = pick("billing_enabled");
-		if (typeof billing_enabled !== "boolean") throw bad("billing_enabled must be true or false");
-		const price_per_user_cents = intField(pick("price_per_user_cents"), "Price per user (cents)", 0, 10_000_000);
-		const base_fee_cents = intField(pick("base_fee_cents"), "Base fee (cents)", 0, 10_000_000);
-		const currency = pick("currency");
-		if (!["CAD", "USD"].includes(currency)) throw bad("currency must be CAD or USD");
-		const expense_account = accountField(pick("expense_account"), "Expense account");
-		const payment_account = accountField(pick("payment_account"), "Payment account");
-		const bill_day = intField(pick("bill_day"), "Billing day", 1, 28);
-
-		if (billing_enabled) {
-			if (!expense_account || !payment_account) throw bad("Choose an expense account and a payment account to enable billing");
-			if (expense_account === payment_account) throw bad("Expense and payment accounts must differ");
-			await checkAccount(expense_account, currency, ["expense"], "Expense");
-			await checkAccount(payment_account, currency, ["asset", "liability"], "Payment");
-		}
-
-		const { rows: [saved] } = await ctx.db.query(
-			`UPDATE ${S}.settings SET tailnet = $1, auth_mode = $2, api_key = $3, oauth_client_id = $4,
-				oauth_client_secret = $5, sync_minutes = $6, key_expiry_warn_days = $7, offline_warn_days = $8,
-				billing_enabled = $9, price_per_user_cents = $10, base_fee_cents = $11, currency = $12,
-				expense_account = $13, payment_account = $14, bill_day = $15, updated_by = $16, updated_at = now()
-			 WHERE id RETURNING *`,
-			[tailnet, auth_mode, api_key, oauth_client_id, oauth_client_secret, sync_minutes, key_expiry_warn_days,
-				offline_warn_days, billing_enabled, price_per_user_cents, base_fee_cents, currency, expense_account,
-				payment_account, bill_day, req.user.username]);
-		oauthToken = null;
-		ctx.log.info("tailscale settings updated", { by: req.user.username, auth_mode, billing_enabled });
-		checkBilling().catch((e) => ctx.log.warn("billing check failed", { error: e.message }));
-		return publicSettings(saved);
-	});
-
 	ctx.route("GET", "/charges", async () =>
 		(await ctx.db.query(`SELECT * FROM ${S}.charges ORDER BY period DESC, id DESC LIMIT 120`)).rows);
 
 	ctx.route("POST", "/charges", async (req) => {
 		const b = req.body ?? {};
 		const s = await getSettings();
-		if (!s.billing_enabled) throw bad("Billing is turned off in the Tailscale settings");
-		if (!s.expense_account || !s.payment_account) throw bad("Choose expense and payment accounts in settings first");
+		if (!s.billing_enabled) throw new ctx.HttpError(409, `Turn billing on under ${SETTINGS_LINK}`);
+		const problems = await billingProblems(s);
+		if (problems.length) throw new ctx.HttpError(409, `${problems.join("; ")} under ${SETTINGS_LINK}`);
 
 		const period = b.period ?? localDate().slice(0, 7);
 		if (typeof period !== "string" || !PERIOD_RE.test(period)) throw bad("period must be YYYY-MM");
@@ -582,8 +499,6 @@ export default async function register(ctx) {
 
 		const total = BigInt(seats) * BigInt(s.price_per_user_cents) + BigInt(s.base_fee_cents);
 		if (total <= 0n) throw bad("The charge comes to 0.00; nothing to post");
-		await checkAccount(s.expense_account, s.currency, ["expense"], "Expense");
-		await checkAccount(s.payment_account, s.currency, ["asset", "liability"], "Payment");
 
 		// Reserve the month first so two clicks can't post twice.
 		let charge;
@@ -653,6 +568,34 @@ export default async function register(ctx) {
 		if (!rowCount) throw new ctx.HttpError(409, "Only a charge stuck in 'pending' for over a minute can be discarded");
 	});
 
+	// Devices and users in Ledger's search bar.
+	ctx.search?.provide(async (query, { limit }) => {
+		const q = String(query).trim();
+		if (q.length < 2) return [];
+		const like = `%${q.replace(/[\\%_]/g, (c) => "\\" + c)}%`;
+		const { rows: devices } = await ctx.db.query(
+			`SELECT name, os, user_login, addresses->>0 AS ip, connected, last_seen FROM ${S}.devices
+			  WHERE name ILIKE $1 OR hostname ILIKE $1 OR user_login ILIKE $1 OR addresses::text ILIKE $1 OR tags::text ILIKE $1
+			  ORDER BY lower(name) LIMIT $2`, [like, limit]);
+		const { rows: users } = await ctx.db.query(
+			`SELECT login_name, display_name, status, device_count FROM ${S}.users
+			  WHERE login_name ILIKE $1 OR display_name ILIKE $1 ORDER BY lower(coalesce(display_name, login_name)) LIMIT $2`,
+			[like, limit]);
+		return [
+			...devices.map((d) => ({
+				title: shortName(d.name),
+				subtitle: ["Tailscale device", d.ip, d.os, d.user_login, d.connected ? "online" : null].filter(Boolean).join(" · "),
+				href: LINK,
+			})),
+			...users.map((u) => ({
+				title: u.display_name || u.login_name,
+				subtitle: ["Tailscale user", u.login_name, u.status, u.device_count != null ? `${u.device_count} device${u.device_count === 1 ? "" : "s"}` : null]
+					.filter(Boolean).join(" · "),
+				href: LINK,
+			})),
+		].slice(0, limit);
+	});
+
 	// ---------------------------------------------------------------- tailnet access (local tailscaled)
 
 	let processUser = "the Ledger service user";
@@ -660,8 +603,7 @@ export default async function register(ctx) {
 		processUser = os.userInfo().username;
 	} catch {}
 	// Default: the port Ledger itself is listening on.
-	const listeners = ownListeners();
-	const detectedTargets = [...new Set(listeners.map((l) => `http://${hostFor(l.ip)}:${l.port}`))];
+	const detectedTargets = [...new Set(ownListeners().map((l) => `http://${hostFor(l.ip)}:${l.port}`))];
 	const defaultTarget = detectedTargets[0]
 		?? `http://127.0.0.1:${/^\d{1,5}$/.test(process.env.PORT ?? "") ? process.env.PORT : 3000}`;
 	const targetOf = (s) => s.serve_target ?? defaultTarget;
@@ -724,28 +666,6 @@ export default async function register(ctx) {
 
 	const nodeStatus = async (s) => (await localJson(s, "GET", "/status?peers=false")).body;
 	const selfDns = (st) => String(st?.Self?.DNSName ?? "").replace(/\.$/, "");
-	const serveUrl = (dns, port) => `https://${dns}${port === 443 ? "" : `:${port}`}/`;
-
-	// Remove every "/" handler that proxies to `target`, then drop emptied entries.
-	// Our port-80 handler: a redirect to the https address (or, on old tailscaled, a proxy).
-	const httpsRedirect = (dns, port) => `301:${serveUrl(dns, port).slice(0, -1)}\${REQUEST_URI}`;
-	const isOurs = (h, s, dns) => !!h && (h.Proxy === targetOf(s) || (!!dns && h.Redirect === httpsRedirect(dns, s.serve_port)));
-
-	// Remove every "/" handler of ours (optionally only on one port), then drop emptied entries.
-	function withoutOurs(cfg, s, dns, onlyPort) {
-		const web = { ...cfg.Web };
-		for (const [hp, w] of Object.entries(web)) {
-			if (onlyPort && !hp.endsWith(`:${onlyPort}`)) continue;
-			if (!isOurs(w?.Handlers?.["/"], s, dns)) continue;
-			const { "/": _, ...rest } = w.Handlers;
-			if (Object.keys(rest).length) web[hp] = { ...w, Handlers: rest };
-			else delete web[hp];
-		}
-		const usedPorts = new Set(Object.keys(web).map((hp) => hp.slice(hp.lastIndexOf(":") + 1)));
-		const tcp = Object.fromEntries(Object.entries(cfg.TCP ?? {}).filter(([p, v]) => !(v?.HTTPS || v?.HTTP) || usedPorts.has(p)));
-		const funnel = Object.fromEntries(Object.entries(cfg.AllowFunnel ?? {}).filter(([hp]) => hp in web));
-		return { ...cfg, Web: web, TCP: tcp, AllowFunnel: funnel };
-	}
 
 	async function nodeInfo(s) {
 		const target = targetOf(s);
@@ -777,21 +697,7 @@ export default async function register(ctx) {
 		if (info.backend_state !== "Running" || !dns) return info;
 		try {
 			const cfg = (await localJson(s, "GET", "/serve-config")).body ?? {};
-			const hp = `${dns}:${s.serve_port}`;
-			const h = cfg.Web?.[hp]?.Handlers?.["/"];
-			info.serving = h?.Proxy === target;
-			info.url = info.serving ? serveUrl(dns, s.serve_port) : null;
-			info.funnel = info.serving && !!cfg.AllowFunnel?.[hp];
-			if (h && !info.serving) info.conflict = `${serveUrl(dns, s.serve_port)} already serves ${h.Proxy ?? h.Path ?? "something else"}`;
-			else if (cfg.TCP?.[s.serve_port] && !cfg.TCP[s.serve_port].HTTPS) info.conflict = `Port ${s.serve_port} is used for TCP forwarding`;
-
-			const h80 = cfg.Web?.[`${dns}:${HTTP_PORT}`]?.Handlers?.["/"];
-			if (isOurs(h80, s, dns)) {
-				info.http_url = `http://${dns}/`;
-				info.http_mode = h80.Redirect ? "redirect" : "proxy";
-			} else if (h80) info.http_conflict = `http://${dns}/ already serves ${h80.Proxy ?? h80.Path ?? h80.Redirect ?? "something else"}`;
-			else if (cfg.TCP?.[HTTP_PORT] && !cfg.TCP[HTTP_PORT].HTTP) info.http_conflict = `Port ${HTTP_PORT} is used for ${cfg.TCP[HTTP_PORT].HTTPS ? "HTTPS" : "TCP forwarding"}`;
-
+			Object.assign(info, describeServe(cfg, { dns, port: s.serve_port, target }));
 			// What Serve will reach when it forwards a request.
 			if (info.serving) info.target_check = await httpProbe(target, ctx.id);
 		} catch (e) {
@@ -814,9 +720,37 @@ export default async function register(ctx) {
 		}));
 	}
 
+	// Write Ledger's Serve entries: https on serve_port, and http on port 80 if wanted.
+	async function applyServe(s, username) {
+		const target = targetOf(s);
+		const st = await nodeStatus(s);
+		if (st.BackendState !== "Running") throw bad(`Tailscale on the Ledger server is not connected (${st.BackendState}). Log it in first`);
+		const dns = selfDns(st);
+		if (!dns) throw bad("This machine has no MagicDNS name: turn on MagicDNS in the Tailscale admin console (DNS page)");
+		if (!st.CertDomains?.length) throw bad("Turn on HTTPS Certificates in the Tailscale admin console (DNS page), then try again");
+		const shown = target.replace("https+insecure", "https");
+		const check = await httpProbe(target, ctx.id);
+		if (!check.ok) throw bad(`Ledger isn't reachable at ${shown}: ${check.reason}. Set the address Ledger listens on under Advanced`);
+		if (!check.ledger) throw bad(`${shown} answers (HTTP ${check.status}) but it isn't Ledger. Set the address Ledger listens on under Advanced`);
+
+		const { body, etag } = await localJson(s, "GET", "/serve-config");
+		let cfg;
+		try {
+			cfg = withLedger(body, { dns, port: s.serve_port, target, http: s.serve_http, version: st.Version });
+		} catch (e) {
+			if (e instanceof ServeConflict) throw new ctx.HttpError(409, e.message);
+			throw e;
+		}
+		await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
+		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`);
+		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), http: s.serve_http, target, by: username });
+		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+	}
+
 	ctx.route("GET", "/node", async () => nodeInfo(await getSettings()));
 
 	ctx.route("PUT", "/node/settings", async (req) => {
+		requireAdmin(req, "change how Ledger is shared on the tailnet");
 		const b = req.body ?? {};
 		const cur = await getSettings();
 		const socket_path = b.socket_path === undefined ? cur.socket_path : b.socket_path;
@@ -846,66 +780,21 @@ export default async function register(ctx) {
 		return nodeInfo(s);
 	});
 
-	// Write Ledger's Serve entries: https on serve_port, and http on port 80 if wanted.
-	async function applyServe(s, username) {
-		const target = targetOf(s);
-		const st = await nodeStatus(s);
-		if (st.BackendState !== "Running") throw bad(`Tailscale on the Ledger server is not connected (${st.BackendState}). Log it in first`);
-		const dns = selfDns(st);
-		if (!dns) throw bad("This machine has no MagicDNS name: turn on MagicDNS in the Tailscale admin console (DNS page)");
-		if (!st.CertDomains?.length) throw bad("Turn on HTTPS Certificates in the Tailscale admin console (DNS page), then try again");
-		const check = await httpProbe(target, ctx.id);
-		if (!check.ok) {
-			throw bad(`Ledger isn't reachable at ${target.replace("https+insecure", "https")}: ${check.reason}. Set the address Ledger listens on under Advanced`);
-		}
-		if (!check.ledger) {
-			throw bad(`${target.replace("https+insecure", "https")} answers (HTTP ${check.status}) but it isn't Ledger. Set the address Ledger listens on under Advanced`);
-		}
-
-		const { body, etag } = await localJson(s, "GET", "/serve-config");
-		let cfg = body ?? {};
-		const hp = `${dns}:${s.serve_port}`;
-		const existing = cfg.Web?.[hp]?.Handlers?.["/"];
-		if (existing && existing.Proxy !== target) {
-			throw new ctx.HttpError(409, `${serveUrl(dns, s.serve_port)} already serves ${existing.Proxy ?? existing.Path ?? "something else"}. Pick another HTTPS port`);
-		}
-		const tcp = cfg.TCP?.[s.serve_port];
-		if (tcp && !tcp.HTTPS) throw new ctx.HttpError(409, `Port ${s.serve_port} is used for TCP forwarding. Pick another HTTPS port`);
-		cfg = {
-			...cfg,
-			TCP: { ...cfg.TCP, [s.serve_port]: { ...tcp, HTTPS: true } },
-			Web: { ...cfg.Web, [hp]: { ...cfg.Web?.[hp], Handlers: { ...cfg.Web?.[hp]?.Handlers, "/": { Proxy: target } } } },
-		};
-
-		// Plain http:// on port 80. Skipped (not an error) if something else already uses it.
-		cfg = withoutOurs(cfg, s, dns, HTTP_PORT);
-		const hp80 = `${dns}:${HTTP_PORT}`;
-		const tcp80 = cfg.TCP?.[HTTP_PORT];
-		if (s.serve_http && !cfg.Web?.[hp80]?.Handlers?.["/"] && !(tcp80 && !tcp80.HTTP)) {
-			const handler = versionAtLeast(st.Version, REDIRECT_SINCE) ? { Redirect: httpsRedirect(dns, s.serve_port) } : { Proxy: target };
-			cfg = {
-				...cfg,
-				TCP: { ...cfg.TCP, [HTTP_PORT]: { ...tcp80, HTTP: true } },
-				Web: { ...cfg.Web, [hp80]: { ...cfg.Web?.[hp80], Handlers: { ...cfg.Web?.[hp80]?.Handlers, "/": handler } } },
-			};
-		}
-
-		await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
-		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`);
-		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), http: s.serve_http, target, by: username });
-		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
-	}
-
 	ctx.route("POST", "/node/serve", async (req) => {
+		requireAdmin(req, "share Ledger on the tailnet");
 		await applyServe(await getSettings(), req.user.username);
 		return nodeInfo(await getSettings());
 	});
 
 	ctx.route("DELETE", "/node/serve", async (req) => {
+		requireAdmin(req, "stop sharing Ledger on the tailnet");
 		const s = await getSettings();
 		const { body, etag } = await localJson(s, "GET", "/serve-config");
 		const dns = await nodeStatus(s).then(selfDns, () => "");
-		if (body) await localJson(s, "POST", "/serve-config", withoutOurs(body, s, dns), etag ? { "If-Match": etag } : {});
+		if (body) {
+			const cfg = withoutLedger(body, { target: targetOf(s), dns, port: s.serve_port });
+			await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
+		}
 		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`);
 		ctx.log.info("ledger unpublished from tailnet", { by: req.user.username });
 		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
@@ -913,7 +802,8 @@ export default async function register(ctx) {
 	});
 
 	// Start an interactive login and hand back the URL to approve this machine.
-	ctx.route("POST", "/node/login", async () => {
+	ctx.route("POST", "/node/login", async (req) => {
+		requireAdmin(req, "log the server in to Tailscale");
 		const s = await getSettings();
 		await localJson(s, "POST", "/login-interactive");
 		for (let i = 0; i < 20; i++) {
@@ -937,7 +827,9 @@ export default async function register(ctx) {
 		if (Date.now() - lastBillingCheck > 3_600_000) await checkBilling();
 		if (s.serve_wanted) await checkServe();
 	}
-	const runTick = () => tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));
+	function runTick() {
+		tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));
+	}
 	setTimeout(runTick, 5_000).unref();
 	setInterval(runTick, 60_000).unref();
 }
