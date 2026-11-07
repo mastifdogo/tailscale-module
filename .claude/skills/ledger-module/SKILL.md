@@ -63,6 +63,12 @@ prints the session cookie). If PostgreSQL has no password yet:
 
 ## 4. Release (only when the user asks)
 
+**Never push to the Ledger repository (`mastifdogo/Bookeeping`) while
+working on this module.** Push only to this repository. If the module needs
+a change in Ledger (a bug fix, a new `ctx` feature, a docs or checker fix),
+make it in a local Ledger checkout, tell the user what it is and why, and
+leave pushing it to them. The module must work without that change.
+
 1. Bump `version` in `ledger-module.json` (and note the change in the README).
 2. Commit, tag `v<version>`, push the tag, and create a GitHub Release from
    it (not a draft or pre-release). If tags or releases can't be created from
