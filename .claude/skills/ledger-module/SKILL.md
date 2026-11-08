@@ -99,3 +99,8 @@ Ledger's dashboard, and books the Tailscale subscription.
   Serve defaults.
 - Roles: sharing, stopping, node login and Access → Advanced are admin-only;
   sync and charges are bookkeeper and up.
+- Organizations (Ledger ≥ 0.11.0): the Serve options and `serve_wanted` are
+  read and written in the main books' copy of `settings` (`inMain`), since
+  they describe the machine. A sync fetches once and records into every
+  organization (`eachOrg`); billing reminders go to organizations whose
+  books pass `billingProblems`.

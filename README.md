@@ -21,9 +21,21 @@ A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailne
 - **Search**: tailnet devices (by name, IP, user, tag) and users show up in
   Ledger's search bar.
 
-Requires **Ledger ≥ 0.10.0**. Configuration is on the module's tab under
+Requires **Ledger ≥ 0.11.0**. Configuration is on the module's tab under
 **Settings → Tailscale**; the module's page has the Access, Overview, Devices,
 Users and Billing tabs.
+
+### Organizations
+
+With several organizations (separate books) on one server:
+
+- **Settings → Tailscale** and the Access tab are server-wide: one tailnet,
+  one Ledger address on it, whichever organization you're in.
+- Each sync fetches from Tailscale once and fills the Devices and Users tabs,
+  search and dashboard alerts of every organization.
+- Billing is per organization: post the charge in the books that pay for
+  Tailscale. The monthly reminder appears in each organization whose books
+  have the configured expense and payment accounts.
 
 ### Who can do what
 
@@ -80,7 +92,7 @@ Notes:
 
 These use the Tailscale API (separate from the tailnet access above).
 
-1. Install the module: Ledger → Settings → Modules → `mastifdogo/tailscale-module` → Add.
+1. Install the module: Ledger → Settings → Modules → `mastifdogo/tailscale_module` → Add.
 2. In the Tailscale admin console, create read-only credentials:
    - **OAuth client** (recommended, doesn't expire): Settings → OAuth clients →
      Generate, with scopes **`devices:core:read`** and **`users:read`**.
@@ -95,7 +107,7 @@ Without `users:read` the devices still sync and the Users tab stays empty
 Credentials are secret fields in Ledger's settings form: write-only in the UI,
 only sent to `api.tailscale.com`, never returned by the module's API, never logged.
 
-Upgrading from 0.0.x: the first start of 0.1.0 copies your saved credentials,
+Upgrading from 0.0.x: the first start of 0.1.1 copies your saved credentials,
 alert and billing options into **Settings → Tailscale** and clears the copies of
 the secrets in the module's own table.
 
@@ -183,7 +195,7 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Changes
 
-- **0.1.0** — needs Ledger 0.10.0. Settings moved to Ledger's settings form
+- **0.1.1** — needs Ledger 0.11.0. Works with organizations (see above). Settings moved to Ledger's settings form
   (copied over automatically); admin-only Serve actions; devices and users in
   Ledger's search; drawn sidebar icon; UI renders API data as text only; tests.
 - **0.0.4** — plain `http://` redirects to https; the target is checked to be Ledger before sharing.
