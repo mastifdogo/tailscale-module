@@ -71,9 +71,11 @@ leave pushing it to them. The module must work without that change.
 
 1. Bump `version` in `ledger-module.json`: new features or behaviour raise the
    middle number (`0.1.1` → `0.2.0`), fixes the last. Note the change in the README.
-2. Commit, tag `v<version>`, push the tag, and create a GitHub Release from
-   it (not a draft or pre-release). If tags or releases can't be created from
-   this session, tell the user which commit to release in GitHub's web UI.
+2. Commit and push `main`. `.github/workflows/release.yml` creates the tag
+   `v<version>` and the GitHub Release; don't make them by hand. If the run
+   fails with "Resource not accessible by integration", the user allows it
+   once: Settings → Actions → General → Workflow permissions → "Read and
+   write permissions" (then Actions → Release → Run workflow).
 3. Ledger installs it on its update schedule or with "Update modules now"
    (Settings → Modules).
 

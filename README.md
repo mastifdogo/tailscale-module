@@ -194,11 +194,16 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Releasing
 
-1. Bump `version` in `ledger-module.json` and note the change below (add a new
-   `migrations/NNN_*.sql` for schema changes, never edit a released one).
-2. `git tag v<version> && git push origin v<version>`
-3. Create a GitHub Release from the tag (not a draft or pre-release).
-   Ledger picks it up on its update schedule or with **Update modules now**.
+1. Bump `version` in `ledger-module.json` (features raise the middle number,
+   fixes the last) and note the change below. Add a new `migrations/NNN_*.sql`
+   for schema changes; never edit a released one.
+2. Commit and push to `main`. The **Release** workflow
+   (`.github/workflows/release.yml`) tags `v<version>` and publishes a GitHub
+   Release with generated notes. Don't create tags or releases by hand.
+   If it fails with "Resource not accessible by integration", allow it once:
+   repository Settings → Actions → General → Workflow permissions →
+   "Read and write permissions", then Actions → Release → Run workflow.
+3. Ledger installs it on its update schedule or with **Update modules now**.
 
 ## Changes
 
