@@ -69,7 +69,8 @@ a change in Ledger (a bug fix, a new `ctx` feature, a docs or checker fix),
 make it in a local Ledger checkout, tell the user what it is and why, and
 leave pushing it to them. The module must work without that change.
 
-1. Bump `version` in `ledger-module.json` (and note the change in the README).
+1. Bump `version` in `ledger-module.json`: new features or behaviour raise the
+   middle number (`0.1.1` → `0.2.0`), fixes the last. Note the change in the README.
 2. Commit, tag `v<version>`, push the tag, and create a GitHub Release from
    it (not a draft or pre-release). If tags or releases can't be created from
    this session, tell the user which commit to release in GitHub's web UI.
@@ -99,8 +100,9 @@ Ledger's dashboard, and books the Tailscale subscription.
   Serve defaults.
 - Roles: sharing, stopping, node login and Access → Advanced are admin-only;
   sync and charges are bookkeeper and up.
-- Organizations (Ledger ≥ 0.11.0): the Serve options and `serve_wanted` are
-  read and written in the main books' copy of `settings` (`inMain`), since
-  they describe the machine. A sync fetches once and records into every
-  organization (`eachOrg`); billing reminders go to organizations whose
-  books pass `billingProblems`.
+- Organizations: settings are per organization (Ledger ≥ 0.11.1), so read
+  `getSettings()` where values are used. Sync, alerts and billing are per
+  organization; `tick` visits each with `eachOrg`, and a manual sync covers
+  the current one. The Serve options and `serve_wanted` describe the machine:
+  read and written in the main books' copy of `settings` (`inMain`), changed
+  only by main-books admins (`requireServeAdmin`).

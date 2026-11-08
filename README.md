@@ -21,7 +21,7 @@ A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailne
 - **Search**: tailnet devices (by name, IP, user, tag) and users show up in
   Ledger's search bar.
 
-Requires **Ledger ≥ 0.11.0**. Configuration is on the module's tab under
+Requires **Ledger ≥ 0.11.1**. Configuration is on the module's tab under
 **Settings → Tailscale**; the module's page has the Access, Overview, Devices,
 Users and Billing tabs.
 
@@ -29,13 +29,18 @@ Users and Billing tabs.
 
 With several organizations (separate books) on one server:
 
-- **Settings → Tailscale** and the Access tab are server-wide: one tailnet,
-  one Ledger address on it, whichever organization you're in.
-- Each sync fetches from Tailscale once and fills the Devices and Users tabs,
-  search and dashboard alerts of every organization.
-- Billing is per organization: post the charge in the books that pay for
-  Tailscale. The monthly reminder appears in each organization whose books
-  have the configured expense and payment accounts.
+- **Settings → Tailscale is per organization**: each organization's admins
+  set its own API credentials, sync interval, alerts and billing. An
+  organization without credentials simply has empty Devices and Users tabs.
+  (Values saved before Ledger 0.11.1 belong to the main books.)
+- Each organization syncs with its own credentials on its own schedule;
+  **Sync now** syncs the organization you're in.
+- Billing is per organization: turn it on in the books that pay for
+  Tailscale and post the charge there.
+- **The Access tab is server-wide**: one Ledger address on the tailnet. Only
+  admins of the main books can share, stop sharing, log the server in or
+  change Advanced; everyone else sees its state. The "not reachable on your
+  tailnet" warning goes to every organization's dashboard.
 
 ### Who can do what
 
@@ -43,8 +48,8 @@ With several organizations (separate books) on one server:
 |---|---|---|---|
 | See everything | ✓ | ✓ | ✓ |
 | Sync now, post or reverse a charge | ✓ | ✓ | |
-| Share / stop sharing Ledger, log the server in, Access → Advanced | ✓ | | |
-| Settings → Tailscale (credentials, alerts, billing) | ✓ | | |
+| Share / stop sharing Ledger, log the server in, Access → Advanced | ✓ (of the main books) | | |
+| Settings → Tailscale (credentials, alerts, billing) | ✓ (of that organization) | | |
 
 ## Put Ledger on your tailnet
 
@@ -195,6 +200,11 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Changes
 
+- **0.2.0** — needs Ledger 0.11.1, where module settings are per organization:
+  each organization syncs with its own credentials and schedule, alerts and
+  billing follow its own settings, and saving the form syncs that organization.
+  Tailnet sharing is managed by admins of the main books only. The one-time
+  move of 0.0.x settings copies only values that were set, never old defaults.
 - **0.1.1** — needs Ledger 0.11.0. Works with organizations (see above). Settings moved to Ledger's settings form
   (copied over automatically); admin-only Serve actions; devices and users in
   Ledger's search; drawn sidebar icon; UI renders API data as text only; tests.

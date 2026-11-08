@@ -163,8 +163,10 @@ async function loadStatus() {
 const views = {
 	async access(el) {
 		const n = await api("/node");
-		const admin = isAdmin();
-		const out = [h("h2", null, "Ledger on your tailnet")];
+		// Sharing is for the whole server: only admins of the main books manage it.
+		const admin = n.can_manage;
+		const out = [h("h2", null, "Ledger on your tailnet"),
+			!admin && isAdmin() && h("p", { class: "muted small" }, "Sharing Ledger on the tailnet affects the whole server, so it's managed from the main books by their admins.")];
 		const act = (label, cls, fn, okMsg) => h("button", { class: cls, async onclick(e) {
 			e.target.disabled = true;
 			try { const r = await fn(); if (r === undefined) return show("access"); if (okMsg) flash(okMsg(r), "ok"); await show("access"); }
@@ -238,7 +240,7 @@ const views = {
 						n.http_wanted ? [" (and ", h("b", null, `http://${self.dns_name}/`), n.http_redirect_supported ? ", which redirects there" : "", ")"] : "",
 						" using Tailscale Serve. It is not exposed to the internet."),
 					admin ? act("Share Ledger on the tailnet", "primary", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`)
-						: h("p", { class: "muted" }, "An admin can share it from here."));
+						: h("p", { class: "muted" }, "An admin of the main books can share it from here."));
 			}
 		}
 
