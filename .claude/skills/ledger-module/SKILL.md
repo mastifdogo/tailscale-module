@@ -106,3 +106,6 @@ Ledger's dashboard, and books the Tailscale subscription.
   the current one. The Serve options and `serve_wanted` describe the machine:
   read and written in the main books' copy of `settings` (`inMain`), changed
   only by main-books admins (`requireServeAdmin`).
+- Charges' journal entries carry a link `charge:<id>` (Ledger ≥ 0.11.2,
+  `chargeLink`); `settlePending` uses `linkedEntries` to finish charges left
+  `pending`, and `linkOldCharges` backfilled links for older charges.

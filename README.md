@@ -21,7 +21,7 @@ A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailne
 - **Search**: tailnet devices (by name, IP, user, tag) and users show up in
   Ledger's search bar.
 
-Requires **Ledger ≥ 0.11.1**. Configuration is on the module's tab under
+Requires **Ledger ≥ 0.11.2**. Configuration is on the module's tab under
 **Settings → Tailscale**; the module's page has the Access, Overview, Devices,
 Users and Billing tabs.
 
@@ -160,9 +160,11 @@ description: Tailscale subscription 2026-10   reference: tailscale:2026-10
   number if your invoice differs.
 - Only one live charge per month. To correct one, **Reverse** it (posts a
   reversing entry dated today) and post again.
-- A charge stuck as `pending` means Ledger stopped while posting. Look for an
-  entry with reference `tailscale:<month>` in the journal; reverse it in Ledger
-  if it exists, then **Discard** the pending charge.
+- Each entry links back to its charge (shown on the entry in Ledger's journal,
+  e.g. "Tailscale 2026-10 · 2 users"); the reversing entry links to it too.
+- A charge stuck as `pending` means Ledger stopped while posting. If its entry
+  was posted, the module finds it through that link and marks the charge
+  posted; otherwise **Discard** it.
 
 ## API
 
@@ -200,6 +202,10 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Changes
 
+- **0.3.0** — needs Ledger 0.11.2. Journal entries for charges (and their
+  reversals) link back to the charge; charges posted earlier get their links
+  once. A charge stuck in `pending` is settled from its linked entry, and
+  can't be discarded if it has one.
 - **0.2.0** — needs Ledger 0.11.1, where module settings are per organization:
   each organization syncs with its own credentials and schedule, alerts and
   billing follow its own settings, and saving the form syncs that organization.

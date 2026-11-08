@@ -477,6 +477,43 @@ export default async function register(ctx) {
 		}));
 	}
 
+	// Journal entries link back to their charge (Ledger 0.11.2): Ledger shows the
+	// link on the entry, and linkedEntries() says which entries a charge has.
+	const chargeRef = (c) => `charge:${c.id}`;
+	const chargeLink = (c, reversal = false) => ({
+		ref: chargeRef(c),
+		label: `${reversal ? "Reversal of " : ""}Tailscale ${c.period} · ${c.seats} user${c.seats === 1 ? "" : "s"}`,
+		href: LINK,
+	});
+
+	// A charge left 'pending' (Ledger stopped while posting it): its entry, if it
+	// was posted, carries the charge's link, so mark it posted.
+	async function settlePending() {
+		const { rows } = await ctx.db.query(
+			`SELECT * FROM ${S}.charges WHERE status = 'pending' AND created_at < now() - interval '1 minute'`);
+		for (const c of rows) {
+			const [linked] = await ctx.ledger.linkedEntries(chargeRef(c));
+			if (!linked) continue;
+			await ctx.db.query(`UPDATE ${S}.charges SET status = 'posted', entry_id = $2 WHERE id = $1 AND status = 'pending'`,
+				[c.id, linked.entry_id]);
+			ctx.log.info("tailscale pending charge found posted", { period: c.period, entry_id: linked.entry_id });
+		}
+	}
+
+	// Charges posted before 0.3.0 have no links yet: add them once.
+	async function linkOldCharges() {
+		const have = new Set((await ctx.ledger.linkedEntries()).map((l) => `${l.ref}#${l.entry_id}`));
+		const { rows } = await ctx.db.query(
+			`SELECT * FROM ${S}.charges WHERE status IN ('posted', 'reversing', 'reversed') AND entry_id IS NOT NULL`);
+		for (const c of rows) {
+			for (const [entryId, reversal] of [[c.entry_id, false], [c.reversal_entry_id, true]]) {
+				if (entryId == null || have.has(`${chargeRef(c)}#${entryId}`)) continue;
+				await ctx.ledger.linkJournalEntry(entryId, chargeLink(c, reversal))
+					.catch((e) => ctx.log.warn("could not link an old Tailscale charge", { period: c.period, error: e.message }));
+			}
+		}
+	}
+
 	function intField(v, name, min, max) {
 		const n = (typeof v === "string" && /^\d+$/.test(v.trim())) || typeof v === "bigint" ? Number(v) : v;
 		if (!Number.isSafeInteger(n) || n < min || n > max) throw bad(`${name} must be a whole number from ${min} to ${max}`);
@@ -530,8 +567,10 @@ export default async function register(ctx) {
 	ctx.route("GET", "/syncs", async () =>
 		(await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 20`)).rows);
 
-	ctx.route("GET", "/charges", async () =>
-		(await ctx.db.query(`SELECT * FROM ${S}.charges ORDER BY period DESC, id DESC LIMIT 120`)).rows);
+	ctx.route("GET", "/charges", async () => {
+		await settlePending();
+		return (await ctx.db.query(`SELECT * FROM ${S}.charges ORDER BY period DESC, id DESC LIMIT 120`)).rows;
+	});
 
 	ctx.route("POST", "/charges", async (req) => {
 		const b = req.body ?? {};
@@ -583,6 +622,7 @@ export default async function register(ctx) {
 					{ account_code: s.expense_account, debit_cents: total, memo: memo?.trim() || lineMemo },
 					{ account_code: s.payment_account, credit_cents: total, memo: lineMemo },
 				],
+				links: [chargeLink(charge)],
 			}, req.user);
 		} catch (e) {
 			await ctx.db.query(`DELETE FROM ${S}.charges WHERE id = $1 AND status = 'pending'`, [charge.id]);
@@ -609,6 +649,8 @@ export default async function register(ctx) {
 			await ctx.db.query(`UPDATE ${S}.charges SET status = 'posted' WHERE id = $1`, [c.id]);
 			throw e;
 		}
+		await ctx.ledger.linkJournalEntry(rev.id, chargeLink(c, true), req.user)
+			.catch((e) => ctx.log.warn("could not link the reversing entry", { period: c.period, error: e.message }));
 		const { rows: [done] } = await ctx.db.query(
 			`UPDATE ${S}.charges SET status = 'reversed', reversal_entry_id = $2 WHERE id = $1 RETURNING *`, [c.id, rev.id]);
 		ctx.log.info("tailscale charge reversed", { period: c.period, entry_id: rev.id, by: req.user.username });
@@ -616,10 +658,13 @@ export default async function register(ctx) {
 		return done;
 	});
 
-	// A charge stuck in 'pending' means Ledger stopped mid-post. Check the journal for
-	// reference tailscale:<period> before discarding.
+	// A charge stuck in 'pending' whose entry never got posted (no linked entry) can go.
 	ctx.route("DELETE", "/charges/:id", async (req) => {
 		if (!/^\d{1,18}$/.test(req.params.id)) throw new ctx.HttpError(404, "Charge not found");
+		await settlePending();
+		if ((await ctx.ledger.linkedEntries(`charge:${req.params.id}`)).length) {
+			throw new ctx.HttpError(409, "This charge has a journal entry; reverse it instead");
+		}
 		const { rowCount } = await ctx.db.query(
 			`DELETE FROM ${S}.charges WHERE id = $1 AND status = 'pending' AND created_at < now() - interval '1 minute'`,
 			[req.params.id]);
@@ -895,5 +940,9 @@ export default async function register(ctx) {
 		tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));
 	}
 	setTimeout(runTick, 5_000).unref();
+	setTimeout(() => eachOrg("linking old charges", async () => {
+		await settlePending();
+		await linkOldCharges();
+	}), 8_000).unref();
 	setInterval(runTick, 60_000).unref();
 }

@@ -366,7 +366,7 @@ const views = {
 					catch (err) { flash(err.message); }
 				} }, "Reverse"),
 				canPost && c.status === "pending" && h("button", { class: "link", async onclick() {
-					if (!confirm("Discard this pending charge? First check the journal for an entry with reference tailscale:<month>; if one exists, reverse it in Ledger.")) return;
+					if (!confirm("Discard this pending charge? Its journal entry was never posted.")) return;
 					try { await api(`/charges/${c.id}`, { method: "DELETE" }); await refresh(); }
 					catch (err) { flash(err.message); }
 				} }, "Discard")))), "")
