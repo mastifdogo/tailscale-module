@@ -5,14 +5,14 @@
 // records the monthly subscription as a balanced journal entry.
 //
 // Configuration lives in Ledger's settings form for this module (manifest
-// "settings", server-wide), except the Serve options on the Access tab, which
-// go with the share/stop actions and are kept in mod_tailscale.settings of the
-// main books (they describe this machine, not an organization).
+// "settings"), except the Serve options on the Access tab, which go with the
+// share/stop actions and are kept in mod_tailscale.settings of the main books:
+// they describe this machine, not an organization, so only an admin of the
+// main books may change them.
 //
-// Organizations (Ledger 0.11): every organization has its own copy of the
-// module's tables. A sync fetches from Tailscale once and writes the snapshot
-// and alerts into each of them; billing reminders go to the organizations
-// whose books have the configured accounts.
+// Organizations (Ledger 0.11.1): every organization has its own copy of the
+// module's tables and its own settings, so it has its own Tailscale
+// credentials, sync, alerts and billing. Background work visits each one.
 
 import http from "node:http";
 import os from "node:os";
@@ -70,13 +70,16 @@ export default async function register(ctx) {
 			}),
 		},
 	});
-	const requireAdmin = (req, what) => {
+	// Sharing Ledger on the tailnet exposes the whole server: main-books admins only.
+	const canManageServe = async (req) => req.user.role === "admin" && (await currentOrgId()) === 1;
+	const requireServeAdmin = async (req, what) => {
 		if (req.user.role !== "admin") throw new ctx.HttpError(403, `Only an admin can ${what}`);
+		if ((await currentOrgId()) !== 1) throw new ctx.HttpError(403, `Switch to the main books to ${what}`);
 	};
-	/** @type {{ value: string, exp: number, clientId: string } | null} */
-	let oauthToken = null;
-	/** @type {Promise<any> | null} */
-	let running = null;
+	/** OAuth access tokens by client id. @type {Map<string, { value: string, exp: number }>} */
+	const oauthTokens = new Map();
+	/** The sync in progress per organization id. @type {Map<number, Promise<any>>} */
+	const running = new Map();
 	let lastBillingCheck = 0;
 
 	// The organization the caller works in (1 = main books, also for background work).
@@ -225,7 +228,12 @@ export default async function register(ctx) {
 			payment_account: old.payment_account ?? undefined,
 			bill_day: old.bill_day,
 		};
-		for (const k of Object.keys(values)) if (values[k] === undefined) delete values[k];
+		// Only what someone set: the old table's defaults would overwrite the form's values.
+		const oldDefaults = {
+			tailnet: "-", sync_minutes: 60, key_expiry_warn_days: 14, offline_warn_days: 30, billing_enabled: false,
+			price_per_user: "6.00", base_fee: "0.00", currency: "USD", bill_day: 1,
+		};
+		for (const k of Object.keys(values)) if (values[k] === undefined || values[k] === oldDefaults[k]) delete values[k];
 		await ctx.settings.set(values);
 		await ctx.db.query(
 			`UPDATE ${S}.settings SET moved_to_ledger_settings = true, api_key = NULL, oauth_client_secret = NULL WHERE id`);
@@ -237,15 +245,17 @@ export default async function register(ctx) {
 		ctx.log.error("could not move tailscale settings; will retry at next start", { error: String(e?.message ?? e) });
 	}
 
-	// Saving the form: use new credentials right away, and recheck billing.
-	ctx.settings.onChange(() => {
-		oauthToken = null;
-		lastBillingCheck = 0;
-		setTimeout(() => {
-			getSettings()
-				.then((s) => (isConfigured(s) ? sync("settings").catch(() => {}) : null))
-				.finally(runTick);
-		}, 1_000).unref();
+	// Saving the form (this runs inside the organization that saved it): use new
+	// credentials right away, and recheck billing there.
+	ctx.settings.onChange(async () => {
+		oauthTokens.clear();
+		try {
+			const s = await getSettings();
+			if (isConfigured(s)) await sync("settings").catch(() => {}); // failure is shown on the dashboard
+			await checkBillingHere(s);
+		} catch (e) {
+			ctx.log.warn("tailscale settings change follow-up failed", { error: String(e?.message ?? e) });
+		}
 	});
 
 	// ---------------------------------------------------------------- Tailscale API
@@ -258,9 +268,8 @@ export default async function register(ctx) {
 		if (!s.oauth_client_id || !s.oauth_client_secret) {
 			throw new ctx.HttpError(409, `Add the Tailscale OAuth client ID and secret under ${SETTINGS_LINK}`);
 		}
-		if (oauthToken && oauthToken.clientId === s.oauth_client_id && oauthToken.exp > Date.now() + 60_000) {
-			return `Bearer ${oauthToken.value}`;
-		}
+		const cached = oauthTokens.get(s.oauth_client_id);
+		if (cached && cached.exp > Date.now() + 60_000) return `Bearer ${cached.value}`;
 		const r = await fetch(`${API}/oauth/token`, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
@@ -272,11 +281,8 @@ export default async function register(ctx) {
 		if (!r.ok) throw new Error(`Tailscale rejected the OAuth client (HTTP ${r.status})`);
 		const j = await r.json();
 		if (typeof j.access_token !== "string") throw new Error("Tailscale OAuth response had no access_token");
-		oauthToken = {
-			value: j.access_token, clientId: s.oauth_client_id,
-			exp: Date.now() + (Number(j.expires_in) || 3600) * 1000,
-		};
-		return `Bearer ${oauthToken.value}`;
+		oauthTokens.set(s.oauth_client_id, { value: j.access_token, exp: Date.now() + (Number(j.expires_in) || 3600) * 1000 });
+		return `Bearer ${j.access_token}`;
 	}
 
 	async function tsGet(s, path) {
@@ -349,18 +355,16 @@ export default async function register(ctx) {
 
 	// ---------------------------------------------------------------- sync
 
-	function sync(triggeredBy) {
-		running ??= doSync(triggeredBy).finally(() => {
-			running = null;
-		});
-		return running;
+	// Sync the current organization (the request's, or the one eachOrg visits).
+	async function sync(triggeredBy) {
+		const org = await currentOrgId();
+		if (!running.has(org)) running.set(org, doSync(triggeredBy).finally(() => running.delete(org)));
+		return running.get(org);
 	}
 
-	// Fetch from Tailscale once, then record the result in every organization.
 	async function doSync(triggeredBy) {
 		const s = await getSettings();
 		if (!isConfigured(s)) throw new ctx.HttpError(409, `Add Tailscale API credentials under ${SETTINGS_LINK}`);
-		const here = await currentOrgId();
 		let devices = null, users = null, warning = null, failure = null;
 		try {
 			const dj = await tsGet(s, "/devices?fields=all");
@@ -380,17 +384,12 @@ export default async function register(ctx) {
 		const message = failure && String(failure?.message ?? failure).slice(0, 500);
 		if (failure) ctx.log.warn("tailscale sync failed", { error: message });
 		else ctx.log.info("tailscale sync ok", { devices: devices.length, users: users?.length ?? null, warning });
-
-		let result = null;
-		await eachOrg("sync", async (org) => {
-			const done = await recordSync(s, triggeredBy, { devices, users, warning, message });
-			if (org.id === here) result = done;
-		});
+		const done = await recordSync(s, triggeredBy, { devices, users, warning, message });
 		if (failure) throw failure instanceof ctx.HttpError ? failure : new ctx.HttpError(502, message);
-		return result;
+		return done;
 	}
 
-	// One organization's copy of a sync: its snapshot tables, sync history and dashboard.
+	// The result of a sync: snapshot tables, sync history and dashboard.
 	async function recordSync(s, triggeredBy, { devices, users, warning, message }) {
 		const { rows: [run] } = await ctx.db.query(
 			`INSERT INTO ${S}.syncs (triggered_by) VALUES ($1) RETURNING id`, [triggeredBy]);
@@ -456,14 +455,9 @@ export default async function register(ctx) {
 			 FROM ${S}.users`)).rows[0];
 
 	// Put a "record this month's charge" to-do on the dashboard once bill_day has
-	// passed, in each organization whose books have the configured accounts.
-	async function checkBilling() {
-		lastBillingCheck = Date.now();
-		const s = await getSettings();
-		if (!s.billing_enabled) return;
-		await eachOrg("billing check", async () => {
-			if (!(await billingProblems(s)).length) await billingReminder(s);
-		});
+	// passed, if billing is on and set up in this organization.
+	async function checkBillingHere(s) {
+		if (s.billing_enabled && !(await billingProblems(s)).length) await billingReminder(s);
 	}
 
 	async function billingReminder(s) {
@@ -507,7 +501,7 @@ export default async function register(ctx) {
 		return {
 			role: req.user.role,
 			configured: isConfigured(s),
-			syncing: !!running,
+			syncing: running.has(await currentOrgId()),
 			// No secrets: only whether they're set.
 			settings: {
 				tailnet: s.tailnet, auth_mode: s.auth_mode, sync_minutes: s.sync_minutes,
@@ -618,7 +612,7 @@ export default async function register(ctx) {
 		const { rows: [done] } = await ctx.db.query(
 			`UPDATE ${S}.charges SET status = 'reversed', reversal_entry_id = $2 WHERE id = $1 RETURNING *`, [c.id, rev.id]);
 		ctx.log.info("tailscale charge reversed", { period: c.period, entry_id: rev.id, by: req.user.username });
-		checkBilling().catch((e) => ctx.log.warn("billing check failed", { error: e.message }));
+		await getSettings().then(checkBillingHere).catch((e) => ctx.log.warn("billing check failed", { error: e.message }));
 		return done;
 	});
 
@@ -811,10 +805,10 @@ export default async function register(ctx) {
 		await eachOrg("tailnet access check", () => clearOrNotifyServe(null));
 	}
 
-	ctx.route("GET", "/node", async () => nodeInfo(await getSettings()));
+	ctx.route("GET", "/node", async (req) => ({ ...(await nodeInfo(await getSettings())), can_manage: await canManageServe(req) }));
 
 	ctx.route("PUT", "/node/settings", async (req) => {
-		requireAdmin(req, "change how Ledger is shared on the tailnet");
+		await requireServeAdmin(req, "change how Ledger is shared on the tailnet");
 		const b = req.body ?? {};
 		const cur = await getSettings();
 		const socket_path = b.socket_path === undefined ? cur.socket_path : b.socket_path;
@@ -841,17 +835,17 @@ export default async function register(ctx) {
 			[socket_path, serve_target, serve_port, serve_http, req.user.username]));
 		const s = await getSettings();
 		if (serving && serve_http !== cur.serve_http) await applyServe(s, req.user.username);
-		return nodeInfo(s);
+		return { ...(await nodeInfo(s)), can_manage: true };
 	});
 
 	ctx.route("POST", "/node/serve", async (req) => {
-		requireAdmin(req, "share Ledger on the tailnet");
+		await requireServeAdmin(req, "share Ledger on the tailnet");
 		await applyServe(await getSettings(), req.user.username);
-		return nodeInfo(await getSettings());
+		return { ...(await nodeInfo(await getSettings())), can_manage: true };
 	});
 
 	ctx.route("DELETE", "/node/serve", async (req) => {
-		requireAdmin(req, "stop sharing Ledger on the tailnet");
+		await requireServeAdmin(req, "stop sharing Ledger on the tailnet");
 		const s = await getSettings();
 		const { body, etag } = await localJson(s, "GET", "/serve-config");
 		const dns = await nodeStatus(s).then(selfDns, () => "");
@@ -862,12 +856,12 @@ export default async function register(ctx) {
 		await inMain(() => ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`));
 		ctx.log.info("ledger unpublished from tailnet", { by: req.user.username });
 		await eachOrg("tailnet access check", () => clearOrNotifyServe(null));
-		return nodeInfo(await getSettings());
+		return { ...(await nodeInfo(await getSettings())), can_manage: true };
 	});
 
 	// Start an interactive login and hand back the URL to approve this machine.
 	ctx.route("POST", "/node/login", async (req) => {
-		requireAdmin(req, "log the server in to Tailscale");
+		await requireServeAdmin(req, "log the server in to Tailscale");
 		const s = await getSettings();
 		await localJson(s, "POST", "/login-interactive");
 		for (let i = 0; i < 20; i++) {
@@ -880,16 +874,22 @@ export default async function register(ctx) {
 
 	// ---------------------------------------------------------------- background
 
+	// Every minute: sync each organization that's due, remind about billing
+	// (hourly), and check that Ledger is still shared if it should be.
 	async function tick() {
-		const s = await getSettings();
-		if (isConfigured(s) && s.sync_minutes > 0 && !running) {
-			const { rows: [due] } = await ctx.db.query(
-				`SELECT coalesce(max(started_at) < now() - make_interval(mins => $1), true) AS due FROM ${S}.syncs`,
-				[s.sync_minutes]);
-			if (due.due) await sync("auto").catch(() => {}); // failure is logged and shown on the dashboard
-		}
-		if (Date.now() - lastBillingCheck > 3_600_000) await checkBilling();
-		if (s.serve_wanted) await checkServe();
+		const billingDue = Date.now() - lastBillingCheck > 3_600_000;
+		if (billingDue) lastBillingCheck = Date.now();
+		await eachOrg("background check", async (org) => {
+			const s = await getSettings();
+			if (isConfigured(s) && s.sync_minutes > 0 && !running.has(org.id)) {
+				const { rows: [due] } = await ctx.db.query(
+					`SELECT coalesce(max(started_at) < now() - make_interval(mins => $1), true) AS due FROM ${S}.syncs`,
+					[s.sync_minutes]);
+				if (due.due) await sync("auto").catch(() => {}); // failure is logged and shown on the dashboard
+			}
+			if (billingDue) await checkBillingHere(s);
+		});
+		if ((await getSettings()).serve_wanted) await checkServe();
 	}
 	function runTick() {
 		tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));

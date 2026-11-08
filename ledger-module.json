@@ -1,9 +1,9 @@
 {
   "id": "tailscale",
   "name": "Tailscale",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Share Ledger on your tailnet via Tailscale Serve; tailnet devices and alerts on the dashboard; Tailscale subscription bookkeeping.",
-  "ledger": ">=0.11.0",
+  "ledger": ">=0.11.1",
   "server": "server.mjs",
   "ui": "ui",
   "nav": {
