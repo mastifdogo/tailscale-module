@@ -21,9 +21,21 @@ A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailne
 - **Search**: tailnet devices (by name, IP, user, tag) and users show up in
   Ledger's search bar.
 
-Requires **Ledger ≥ 0.10.0**. Configuration is on the module's tab under
+Requires **Ledger ≥ 0.11.0**. Configuration is on the module's tab under
 **Settings → Tailscale**; the module's page has the Access, Overview, Devices,
 Users and Billing tabs.
+
+### Organizations
+
+With several organizations (separate books) on one server:
+
+- **Settings → Tailscale** and the Access tab are server-wide: one tailnet,
+  one Ledger address on it, whichever organization you're in.
+- Each sync fetches from Tailscale once and fills the Devices and Users tabs,
+  search and dashboard alerts of every organization.
+- Billing is per organization: post the charge in the books that pay for
+  Tailscale. The monthly reminder appears in each organization whose books
+  have the configured expense and payment accounts.
 
 ### Who can do what
 
@@ -183,7 +195,7 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Changes
 
-- **0.1.0** — needs Ledger 0.10.0. Settings moved to Ledger's settings form
+- **0.1.1** — needs Ledger 0.11.0. Works with organizations (see above). Settings moved to Ledger's settings form
   (copied over automatically); admin-only Serve actions; devices and users in
   Ledger's search; drawn sidebar icon; UI renders API data as text only; tests.
 - **0.0.4** — plain `http://` redirects to https; the target is checked to be Ledger before sharing.

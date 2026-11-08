@@ -5,8 +5,14 @@
 // records the monthly subscription as a balanced journal entry.
 //
 // Configuration lives in Ledger's settings form for this module (manifest
-// "settings"), except the Serve options on the Access tab, which go with the
-// share/stop actions and are kept in mod_tailscale.settings.
+// "settings", server-wide), except the Serve options on the Access tab, which
+// go with the share/stop actions and are kept in mod_tailscale.settings of the
+// main books (they describe this machine, not an organization).
+//
+// Organizations (Ledger 0.11): every organization has its own copy of the
+// module's tables. A sync fetches from Tailscale once and writes the snapshot
+// and alerts into each of them; billing reminders go to the organizations
+// whose books have the configured accounts.
 
 import http from "node:http";
 import os from "node:os";
@@ -73,6 +79,40 @@ export default async function register(ctx) {
 	let running = null;
 	let lastBillingCheck = 0;
 
+	// The organization the caller works in (1 = main books, also for background work).
+	const currentOrgId = async () => (ctx.orgs ? (await ctx.orgs.current()).id : 1);
+
+	// Run fn in the main books, from whichever organization we're in.
+	async function inMain(fn) {
+		if ((await currentOrgId()) === 1) return fn();
+		let out, failure, ran = false;
+		await ctx.orgs.forEach(async (org) => {
+			if (org.id !== 1) return;
+			ran = true;
+			try {
+				out = await fn();
+			} catch (e) {
+				failure = e;
+			}
+		});
+		if (failure) throw failure;
+		if (!ran) throw new Error("the main books aren't available");
+		return out;
+	}
+
+	// Run fn once per organization; one organization failing doesn't stop the rest.
+	async function eachOrg(what, fn) {
+		const run = async (org) => {
+			try {
+				await fn(org);
+			} catch (e) {
+				ctx.log.error(`tailscale ${what} failed`, { organization: org.id, error: String(e?.message ?? e) });
+			}
+		};
+		if (ctx.orgs) await ctx.orgs.forEach(run);
+		else await run({ id: 1 });
+	}
+
 	// Run a dashboard call without letting a failure there break the caller.
 	async function safe(fn) {
 		try {
@@ -92,7 +132,7 @@ export default async function register(ctx) {
 	async function getSettings() {
 		const [v, { rows: [local] }] = await Promise.all([
 			ctx.settings.get(),
-			ctx.db.query(`SELECT socket_path, serve_target, serve_port, serve_http, serve_wanted FROM ${S}.settings WHERE id`),
+			inMain(() => ctx.db.query(`SELECT socket_path, serve_target, serve_port, serve_http, serve_wanted FROM ${S}.settings WHERE id`)),
 		]);
 		const problems = [];
 		const text = (k) => (typeof v[k] === "string" ? v[k].trim() : "");
@@ -316,44 +356,61 @@ export default async function register(ctx) {
 		return running;
 	}
 
+	// Fetch from Tailscale once, then record the result in every organization.
 	async function doSync(triggeredBy) {
 		const s = await getSettings();
 		if (!isConfigured(s)) throw new ctx.HttpError(409, `Add Tailscale API credentials under ${SETTINGS_LINK}`);
-		const { rows: [run] } = await ctx.db.query(
-			`INSERT INTO ${S}.syncs (triggered_by) VALUES ($1) RETURNING id`, [triggeredBy]);
+		const here = await currentOrgId();
+		let devices = null, users = null, warning = null, failure = null;
 		try {
 			const dj = await tsGet(s, "/devices?fields=all");
 			if (!Array.isArray(dj?.devices)) throw new Error("Unexpected response from Tailscale /devices");
-			const deviceCount = await replaceSnapshot("devices", DEVICE_COLS, dj.devices.map(toDevice));
-
+			devices = dj.devices.map(toDevice);
 			// The users endpoint needs an extra scope; devices alone are still useful.
-			let userCount = null, warning = null;
 			try {
 				const uj = await tsGet(s, "/users");
 				if (!Array.isArray(uj?.users)) throw new Error("Unexpected response from Tailscale /users");
-				userCount = await replaceSnapshot("users", USER_COLS, uj.users.map(toUser));
+				users = uj.users.map(toUser);
 			} catch (e) {
 				warning = `Users not synced: ${e.message}`;
 			}
-
-			const { rows: [done] } = await ctx.db.query(
-				`UPDATE ${S}.syncs SET finished_at = now(), ok = true, warning = $2, device_count = $3, user_count = $4
-				 WHERE id = $1 RETURNING *`, [run.id, warning, deviceCount, userCount]);
-			await ctx.db.query(`DELETE FROM ${S}.syncs WHERE id < (SELECT max(id) - 200 FROM ${S}.syncs)`);
-			ctx.log.info("tailscale sync ok", { devices: deviceCount, users: userCount, warning });
-			await safe(() => ctx.dashboard.remove("sync-error", "notification"));
-			await raiseAlerts(s);
-			return done;
 		} catch (e) {
-			const message = String(e?.message ?? e).slice(0, 500);
+			failure = e;
+		}
+		const message = failure && String(failure?.message ?? failure).slice(0, 500);
+		if (failure) ctx.log.warn("tailscale sync failed", { error: message });
+		else ctx.log.info("tailscale sync ok", { devices: devices.length, users: users?.length ?? null, warning });
+
+		let result = null;
+		await eachOrg("sync", async (org) => {
+			const done = await recordSync(s, triggeredBy, { devices, users, warning, message });
+			if (org.id === here) result = done;
+		});
+		if (failure) throw failure instanceof ctx.HttpError ? failure : new ctx.HttpError(502, message);
+		return result;
+	}
+
+	// One organization's copy of a sync: its snapshot tables, sync history and dashboard.
+	async function recordSync(s, triggeredBy, { devices, users, warning, message }) {
+		const { rows: [run] } = await ctx.db.query(
+			`INSERT INTO ${S}.syncs (triggered_by) VALUES ($1) RETURNING id`, [triggeredBy]);
+		if (message) {
 			await ctx.db.query(
 				`UPDATE ${S}.syncs SET finished_at = now(), ok = false, error = $2 WHERE id = $1`, [run.id, message]);
-			ctx.log.warn("tailscale sync failed", { error: message });
 			await safe(() => ctx.dashboard.notify({
 				key: "sync-error", title: "Tailscale sync failed", body: message, level: "danger", link: LINK,
 			}));
-			throw e instanceof ctx.HttpError ? e : new ctx.HttpError(502, message);
+			return null;
 		}
+		const deviceCount = await replaceSnapshot("devices", DEVICE_COLS, devices);
+		const userCount = users ? await replaceSnapshot("users", USER_COLS, users) : null;
+		const { rows: [done] } = await ctx.db.query(
+			`UPDATE ${S}.syncs SET finished_at = now(), ok = true, warning = $2, device_count = $3, user_count = $4
+			 WHERE id = $1 RETURNING *`, [run.id, warning, deviceCount, userCount]);
+		await ctx.db.query(`DELETE FROM ${S}.syncs WHERE id < (SELECT max(id) - 200 FROM ${S}.syncs)`);
+		await safe(() => ctx.dashboard.remove("sync-error", "notification"));
+		await raiseAlerts(s);
+		return done;
 	}
 
 	// Post or clear one dashboard notification per kind of problem.
@@ -398,11 +455,18 @@ export default async function register(ctx) {
 			`SELECT count(*) FILTER (WHERE type = 'member' AND status = 'active')::int AS seats, count(*)::int AS users
 			 FROM ${S}.users`)).rows[0];
 
-	// Put a "record this month's charge" to-do on the dashboard once bill_day has passed.
+	// Put a "record this month's charge" to-do on the dashboard once bill_day has
+	// passed, in each organization whose books have the configured accounts.
 	async function checkBilling() {
 		lastBillingCheck = Date.now();
 		const s = await getSettings();
 		if (!s.billing_enabled) return;
+		await eachOrg("billing check", async () => {
+			if (!(await billingProblems(s)).length) await billingReminder(s);
+		});
+	}
+
+	async function billingReminder(s) {
 		const now = new Date();
 		const period = localDate(now).slice(0, 7);
 		const key = `charge-${period}`;
@@ -706,19 +770,19 @@ export default async function register(ctx) {
 		return info;
 	}
 
-	// Alert on the dashboard when Ledger was published but no longer is.
+	// Alert on every organization's dashboard when Ledger was published but no longer is.
 	async function checkServe() {
 		const s = await getSettings();
-		if (!s.serve_wanted) return safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
-		const n = await nodeInfo(s);
-		if (n.serving) return safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
-		const why = !n.reachable ? n.error
+		const n = s.serve_wanted ? await nodeInfo(s) : null;
+		const why = !n || n.serving ? null
+			: !n.reachable ? n.error
 			: n.backend_state !== "Running" ? `Tailscale on the server is ${n.backend_state}.`
 			: n.serve_error ?? n.conflict ?? "The Tailscale Serve entry for Ledger was removed.";
-		await safe(() => ctx.dashboard.notify({
-			key: "tailnet-access", title: "Ledger isn't reachable on your tailnet", body: why, level: "warning", link: LINK,
-		}));
+		await eachOrg("tailnet access check", () => clearOrNotifyServe(why));
 	}
+	const clearOrNotifyServe = (why) => safe(() => why
+		? ctx.dashboard.notify({ key: "tailnet-access", title: "Ledger isn't reachable on your tailnet", body: why, level: "warning", link: LINK })
+		: ctx.dashboard.remove("tailnet-access", "notification"));
 
 	// Write Ledger's Serve entries: https on serve_port, and http on port 80 if wanted.
 	async function applyServe(s, username) {
@@ -742,9 +806,9 @@ export default async function register(ctx) {
 			throw e;
 		}
 		await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
-		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`);
+		await inMain(() => ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = true WHERE id`));
 		ctx.log.info("ledger published on tailnet", { url: serveUrl(dns, s.serve_port), http: s.serve_http, target, by: username });
-		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		await eachOrg("tailnet access check", () => clearOrNotifyServe(null));
 	}
 
 	ctx.route("GET", "/node", async () => nodeInfo(await getSettings()));
@@ -771,10 +835,10 @@ export default async function register(ctx) {
 		const changesServe = targetOf(cur) !== (serve_target ?? defaultTarget) || serve_port !== cur.serve_port;
 		const serving = (await nodeInfo(cur)).serving;
 		if (changesServe && serving) throw new ctx.HttpError(409, "Stop sharing Ledger on the tailnet before changing its address or port");
-		await ctx.db.query(
+		await inMain(() => ctx.db.query(
 			`UPDATE ${S}.settings SET socket_path = $1, serve_target = $2, serve_port = $3, serve_http = $4,
 				updated_by = $5, updated_at = now() WHERE id`,
-			[socket_path, serve_target, serve_port, serve_http, req.user.username]);
+			[socket_path, serve_target, serve_port, serve_http, req.user.username]));
 		const s = await getSettings();
 		if (serving && serve_http !== cur.serve_http) await applyServe(s, req.user.username);
 		return nodeInfo(s);
@@ -795,9 +859,9 @@ export default async function register(ctx) {
 			const cfg = withoutLedger(body, { target: targetOf(s), dns, port: s.serve_port });
 			await localJson(s, "POST", "/serve-config", cfg, etag ? { "If-Match": etag } : {});
 		}
-		await ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`);
+		await inMain(() => ctx.db.query(`UPDATE ${S}.settings SET serve_wanted = false WHERE id`));
 		ctx.log.info("ledger unpublished from tailnet", { by: req.user.username });
-		await safe(() => ctx.dashboard.remove("tailnet-access", "notification"));
+		await eachOrg("tailnet access check", () => clearOrNotifyServe(null));
 		return nodeInfo(await getSettings());
 	});
 
