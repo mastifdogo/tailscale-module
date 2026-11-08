@@ -92,7 +92,7 @@ Notes:
 
 These use the Tailscale API (separate from the tailnet access above).
 
-1. Install the module: Ledger → Settings → Modules → `mastifdogo/tailscale-module` → Add.
+1. Install the module: Ledger → Settings → Modules → `mastifdogo/tailscale_module` → Add.
 2. In the Tailscale admin console, create read-only credentials:
    - **OAuth client** (recommended, doesn't expire): Settings → OAuth clients →
      Generate, with scopes **`devices:core:read`** and **`users:read`**.
@@ -107,7 +107,7 @@ Without `users:read` the devices still sync and the Users tab stays empty
 Credentials are secret fields in Ledger's settings form: write-only in the UI,
 only sent to `api.tailscale.com`, never returned by the module's API, never logged.
 
-Upgrading from 0.0.x: the first start of 0.1.0 copies your saved credentials,
+Upgrading from 0.0.x: the first start of 0.1.1 copies your saved credentials,
 alert and billing options into **Settings → Tailscale** and clears the copies of
 the secrets in the module's own table.
 
