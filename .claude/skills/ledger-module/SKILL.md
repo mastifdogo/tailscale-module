@@ -76,8 +76,10 @@ leave pushing it to them. The module must work without that change.
    fails with "Resource not accessible by integration", the user allows it
    once: Settings → Actions → General → Workflow permissions → "Read and
    write permissions" (then Actions → Release → Run workflow).
-3. Ledger installs it on its update schedule or with "Update modules now"
-   (Settings → Modules).
+3. Ledger installs it on its update schedule, with "Update modules now"
+   (Settings → Modules), or at server start if "Update when the server
+   starts" is on (Settings → Updates, Ledger ≥ 0.12.1). Tell the user which
+   will pick it up; "Update modules now" is the quickest.
 
 ## This module: Tailscale (`id: tailscale`, schema `mod_tailscale`)
 
@@ -111,3 +113,9 @@ Ledger's dashboard, and books the Tailscale subscription.
 - Charges' journal entries carry a link `charge:<id>` (Ledger ≥ 0.11.2,
   `chargeLink`); `settlePending` uses `linkedEntries` to finish charges left
   `pending`, and `linkOldCharges` backfilled links for older charges.
+- Billing accounts: the Billing tab offers Ledger's "+ New account…" dialog
+  (`newAccount()`, the `ledger-new-account` message, Ledger ≥ 0.11.3) for a
+  missing or unsuitable account and saves the result with
+  `PUT /billing/accounts` (admins). Backups (Ledger ≥ 0.13.0) save each table
+  as CSV: keep names plain and secrets out of tables (`settings.api_key` and
+  `oauth_client_secret` are only filled until 0.1.0's one-time move).

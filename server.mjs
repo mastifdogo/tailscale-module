@@ -179,19 +179,32 @@ export default async function register(ctx) {
 	const isConfigured = (s) =>
 		s.auth_mode === "api_key" ? !!s.api_key : !!(s.oauth_client_id && s.oauth_client_secret);
 
+	// The two accounts a charge posts to, with the setting that holds each.
+	const BILLING_ACCOUNTS = [
+		{ role: "expense", setting: "expense_account", types: ["expense"], label: "Expense" },
+		{ role: "payment", setting: "payment_account", types: ["asset", "liability"], label: "Payment" },
+	];
+
+	// Each billing account's code and what's wrong with it (null when it's fine).
+	async function billingAccounts(s) {
+		const out = {};
+		for (const a of BILLING_ACCOUNTS) {
+			const code = s[a.setting];
+			let problem = null;
+			if (!code) problem = `Set the ${a.label.toLowerCase()} account`;
+			else if (!CODE_RE.test(code)) problem = `${a.label} account "${code.slice(0, 40)}" isn't an account code`;
+			else await checkAccount(code, s.currency, a.types, a.label).catch((e) => (problem = e.message));
+			out[a.role] = { code, problem };
+		}
+		return out;
+	}
+
 	// Why billing can't post right now, or [] when it can.
-	async function billingProblems(s) {
+	async function billingProblems(s, accounts) {
 		if (!s.billing_enabled) return [];
 		const out = [];
 		if (s.price_per_user_cents === null || s.base_fee_cents === null) out.push("Fix the prices");
-		for (const [code, types, label] of [
-			[s.expense_account, ["expense"], "Expense"],
-			[s.payment_account, ["asset", "liability"], "Payment"],
-		]) {
-			if (!code) out.push(`Set the ${label.toLowerCase()} account`);
-			else if (!CODE_RE.test(code)) out.push(`${label} account "${code.slice(0, 40)}" isn't an account code`);
-			else await checkAccount(code, s.currency, types, label).catch((e) => out.push(e.message));
-		}
+		for (const a of Object.values(accounts ?? await billingAccounts(s))) if (a.problem) out.push(a.problem);
 		if (s.expense_account && s.expense_account === s.payment_account) out.push("Expense and payment accounts must differ");
 		return out;
 	}
@@ -547,7 +560,10 @@ export default async function register(ctx) {
 				currency: s.currency, expense_account: s.expense_account, payment_account: s.payment_account, bill_day: s.bill_day,
 			},
 			problems: s.problems,
-			billing_problems: await billingProblems(s),
+			...(await (async () => {
+				const accounts = s.billing_enabled ? await billingAccounts(s) : null;
+				return { billing_accounts: accounts, billing_problems: await billingProblems(s, accounts) };
+			})()),
 			last_sync: lastSync ?? null,
 			counts: { ...counts, ...(await billableSeats()) },
 			period,
@@ -566,6 +582,31 @@ export default async function register(ctx) {
 
 	ctx.route("GET", "/syncs", async () =>
 		(await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 20`)).rows);
+
+	// Use an account for billing, e.g. one just made with Ledger's "+ New account…"
+	// dialog: saved into this organization's settings form (admins only, like the form).
+	ctx.route("PUT", "/billing/accounts", async (req) => {
+		if (req.user.role !== "admin") throw new ctx.HttpError(403, "Only an admin can change the billing accounts");
+		const b = req.body;
+		if (!b || typeof b !== "object" || Array.isArray(b)) throw bad("Send {expense_account?, payment_account?}");
+		const s = await getSettings();
+		const values = {};
+		for (const a of BILLING_ACCOUNTS) {
+			const code = b[a.setting];
+			if (code === undefined) continue;
+			if (typeof code !== "string" || !CODE_RE.test(code)) throw bad(`${a.setting} must be an account code`);
+			await checkAccount(code, s.currency, a.types, a.label);
+			values[a.setting] = code;
+		}
+		if (!Object.keys(values).length) throw bad("Send expense_account or payment_account");
+		if ((values.expense_account ?? s.expense_account) === (values.payment_account ?? s.payment_account)) {
+			throw bad("Expense and payment accounts must differ");
+		}
+		await ctx.settings.set(values);
+		ctx.log.info("tailscale billing accounts set", { ...values, by: req.user.username });
+		const next = await getSettings();
+		return { billing_accounts: await billingAccounts(next), billing_problems: await billingProblems(next) };
+	});
 
 	ctx.route("GET", "/charges", async () => {
 		await settlePending();

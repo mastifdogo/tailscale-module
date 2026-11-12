@@ -21,7 +21,7 @@ A Ledger module that puts Ledger on your Tailscale tailnet and brings the tailne
 - **Search**: tailnet devices (by name, IP, user, tag) and users show up in
   Ledger's search bar.
 
-Requires **Ledger ≥ 0.11.2**. Configuration is on the module's tab under
+Requires **Ledger ≥ 0.11.3**. Configuration is on the module's tab under
 **Settings → Tailscale**; the module's page has the Access, Overview, Devices,
 Users and Billing tabs.
 
@@ -130,7 +130,11 @@ Turn on **Record the subscription in the ledger** under **Settings → Tailscale
 | Paid from (credit) | — | Code of an active **asset** (bank) or **liability** (credit card, payables) account in that currency |
 
 The Billing tab says what's missing or wrong (an account that doesn't exist,
-is in another currency, a price that isn't an amount) until it can post.
+is in another currency, a price that isn't an amount) until it can post. For
+a missing or unsuitable account, admins get **+ New account…**: Ledger's
+New account dialog opens over the page, prefilled (e.g. "Software
+subscriptions", expense, in the billing currency), and the account it creates
+is saved as that billing account in **Settings → Tailscale**.
 
 ### Accounts it expects
 
@@ -179,6 +183,7 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 | `GET /status` | your role, connection state, settings problems, counts, last sync, this month's charge |
 | `POST /sync` | sync now |
 | `GET /devices`, `GET /users`, `GET /syncs` | snapshots and the last 20 syncs |
+| `PUT /billing/accounts` | `{expense_account?, payment_account?}`: use these accounts for billing (admins; saved in Settings → Tailscale) |
 | `GET /charges`, `POST /charges` | charges; `POST {period?, entry_date?, seats?, memo?}` |
 | `POST /charges/:id/reverse` | reverse a posted charge |
 | `DELETE /charges/:id` | discard a charge stuck in `pending` |
@@ -203,10 +208,15 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
    If it fails with "Resource not accessible by integration", allow it once:
    repository Settings → Actions → General → Workflow permissions →
    "Read and write permissions", then Actions → Release → Run workflow.
-3. Ledger installs it on its update schedule or with **Update modules now**.
+3. Ledger installs it on its update schedule, with **Update modules now**
+   (Settings → Modules, the quickest), or at the next server start if
+   **Update when the server starts** is on (Settings → Updates, Ledger ≥ 0.12.1).
 
 ## Changes
 
+- **0.4.0** — needs Ledger 0.11.3. **+ New account…** on the Billing tab
+  creates a missing billing account with Ledger's dialog and saves it in the
+  settings (new route `PUT /billing/accounts`, admins only).
 - **0.3.0** — needs Ledger 0.11.2. Journal entries for charges (and their
   reversals) link back to the charge; charges posted earlier get their links
   once. A charge stuck in `pending` is settled from its linked entry, and

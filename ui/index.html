@@ -135,6 +135,22 @@ function table(head, rows, empty) {
 		h("tbody", null, rows.length ? rows : h("tr", null, h("td", { colspan: head.length, class: "muted" }, empty)))));
 }
 
+// "+ New account…" (Ledger ≥ 0.11.3): Ledger opens its New account dialog over this
+// page and answers with the account it created, or null if cancelled.
+// (The id uses getRandomValues: crypto.randomUUID only exists on HTTPS pages,
+// and Ledger is often opened over plain http on a LAN or tailnet address.)
+function newAccount(defaults = {}) {
+	const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+	return new Promise((resolve) => {
+		addEventListener("message", function on(e) {
+			if (e.origin !== location.origin || e.data?.type !== "ledger-new-account-result" || e.data.id !== id) return;
+			removeEventListener("message", on);
+			resolve(e.data.account);
+		});
+		parent.postMessage({ type: "ledger-new-account", id, defaults }, location.origin);
+	});
+}
+
 let state = { status: null, tab: "access", filter: "" };
 try { state.tab = localStorage.getItem("tailscale.tab") || "access"; } catch {}
 const isAdmin = () => state.status?.role === "admin";
@@ -377,7 +393,30 @@ const views = {
 			return;
 		}
 		if (st.billing_problems.length || !canPost) {
-			replace(el, st.billing_problems.map((p) => msg("warn", ...settingsHint(p))),
+			const accounts = st.billing_accounts || {};
+			const accountProblems = new Set(Object.values(accounts).map((a) => a.problem).filter(Boolean));
+			// Admins can make a missing account right here and have it saved into the settings.
+			const newAccountButton = (role) => {
+				const a = accounts[role];
+				const missing = a.code && a.problem.endsWith("does not exist");
+				const defaults = role === "expense"
+					? { name: "Software subscriptions", type: "expense", currency: s.currency, description: "Tailscale and other software" }
+					: { name: "Credit card", type: "liability", currency: s.currency };
+				if (missing) defaults.code = a.code;
+				return h("button", { class: "link", async onclick() {
+					const created = await newAccount(defaults);
+					if (!created) return;
+					try {
+						await api("/billing/accounts", { method: "PUT", body: JSON.stringify({ [`${role}_account`]: created.code }) });
+						flash(`Created ${created.code} · ${created.name} and set it as the ${role} account.`, "ok");
+						await refresh();
+					} catch (err) { flash(err.message); }
+				} }, "+ New account…");
+			};
+			replace(el,
+				Object.entries(accounts).filter(([, a]) => a.problem).map(([role, a]) =>
+					msg("warn", ...settingsHint(a.problem), isAdmin() && [" ", newAccountButton(role)])),
+				st.billing_problems.filter((p) => !accountProblems.has(p)).map((p) => msg("warn", ...settingsHint(p))),
 				!canPost && h("p", { class: "muted" }, "Viewers can't post charges."), history);
 			return;
 		}
