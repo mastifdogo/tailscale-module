@@ -164,6 +164,9 @@ description: Tailscale subscription 2026-10   reference: tailscale:2026-10
   number if your invoice differs.
 - Only one live charge per month. To correct one, **Reverse** it (posts a
   reversing entry dated today) and post again.
+- On Ledger 0.16 and later, each entry names **Tailscale** as its vendor
+  (Ledger's shared customer and vendor list under Entities; added there the
+  first time). If someone made that vendor inactive, entries post without one.
 - Each entry links back to its charge (shown on the entry in Ledger's journal,
   e.g. "Tailscale 2026-10 · 2 users"); the reversing entry links to it too.
 - A charge stuck as `pending` means Ledger stopped while posting. If its entry
@@ -214,6 +217,10 @@ All under `/api/v1/m/tailscale`, logged-in users only (Ledger refuses non-GET re
 
 ## Changes
 
+- **0.5.0** — charges' journal entries name Tailscale as the vendor (Ledger
+  0.16 entities; skipped on older Ledgers). Safe with Ledger 0.14's restores:
+  the one-time settings move never overwrites values the settings form
+  already holds, so restoring an old backup can't bring back stale credentials.
 - **0.4.0** — needs Ledger 0.11.3. **+ New account…** on the Billing tab
   creates a missing billing account with Ledger's dialog and saves it in the
   settings (new route `PUT /billing/accounts`, admins only).

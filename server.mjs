@@ -14,6 +14,7 @@
 // module's tables and its own settings, so it has its own Tailscale
 // credentials, sync, alerts and billing. Background work visits each one.
 
+import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import {
@@ -21,6 +22,14 @@ import {
 	listNames, localDate, normalizeTarget, ownListeners, pad, serveUrl, shortName, toCents, versionAtLeast,
 	withLedger, withoutLedger,
 } from "./lib.mjs";
+
+// The settings form's defaults, straight from the manifest.
+const FORM_DEFAULTS = Object.fromEntries(
+	JSON.parse(fs.readFileSync(new URL("./ledger-module.json", import.meta.url), "utf8"))
+		.settings.fields.map((f) => [f.key, f.default ?? null]),
+);
+const CREDENTIAL_KEYS = ["auth_mode", "api_key", "oauth_client_id", "oauth_client_secret"];
+const VENDOR_NAME = "Tailscale";
 
 const API = "https://api.tailscale.com/api/v2";
 const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
@@ -247,10 +256,18 @@ export default async function register(ctx) {
 			price_per_user: "6.00", base_fee: "0.00", currency: "USD", bill_day: 1,
 		};
 		for (const k of Object.keys(values)) if (values[k] === undefined || values[k] === oldDefaults[k]) delete values[k];
-		await ctx.settings.set(values);
+		// And never over what the form already holds: a restored old backup (Ledger 0.14)
+		// brings this table back unmoved while the form keeps today's values.
+		const form = await ctx.settings.get();
+		const formHas = (k) => form[k] !== null && form[k] !== undefined && form[k] !== "" && form[k] !== FORM_DEFAULTS[k];
+		const formHasCredentials = CREDENTIAL_KEYS.filter((k) => k !== "auth_mode").some(formHas);
+		for (const k of Object.keys(values)) {
+			if (CREDENTIAL_KEYS.includes(k) ? formHasCredentials : formHas(k)) delete values[k];
+		}
+		if (Object.keys(values).length) await ctx.settings.set(values);
 		await ctx.db.query(
 			`UPDATE ${S}.settings SET moved_to_ledger_settings = true, api_key = NULL, oauth_client_secret = NULL WHERE id`);
-		ctx.log.info("tailscale settings moved to Ledger's settings form", { credentials: hadCredentials });
+		ctx.log.info("tailscale settings moved to Ledger's settings form", { moved: Object.keys(values).filter((k) => !k.includes("secret") && k !== "api_key") });
 	}
 	try {
 		await moveOldSettings();
@@ -527,6 +544,19 @@ export default async function register(ctx) {
 		}
 	}
 
+	// Tailscale in Ledger's shared vendor list (Ledger 0.16), so its charges show who
+	// they're with. Older Ledgers, or a vendor someone made inactive: post without one.
+	async function tailscaleVendor() {
+		if (!ctx.entities?.ensure) return null;
+		try {
+			const v = await ctx.entities.ensure(VENDOR_NAME, "vendor");
+			return v?.is_active === false ? null : v;
+		} catch (e) {
+			ctx.log.warn("could not find or add the Tailscale vendor", { error: String(e?.message ?? e) });
+			return null;
+		}
+	}
+
 	function intField(v, name, min, max) {
 		const n = (typeof v === "string" && /^\d+$/.test(v.trim())) || typeof v === "bigint" ? Number(v) : v;
 		if (!Number.isSafeInteger(n) || n < min || n > max) throw bad(`${name} must be a whole number from ${min} to ${max}`);
@@ -654,6 +684,7 @@ export default async function register(ctx) {
 
 		let entry;
 		try {
+			const vendor = await tailscaleVendor();
 			const lineMemo = `${seats} user${seats === 1 ? "" : "s"}`;
 			entry = await ctx.ledger.createJournalEntry({
 				entry_date,
@@ -664,6 +695,7 @@ export default async function register(ctx) {
 					{ account_code: s.payment_account, credit_cents: total, memo: lineMemo },
 				],
 				links: [chargeLink(charge)],
+				...(vendor ? { entity_id: vendor.id } : {}),
 			}, req.user);
 		} catch (e) {
 			await ctx.db.query(`DELETE FROM ${S}.charges WHERE id = $1 AND status = 'pending'`, [charge.id]);

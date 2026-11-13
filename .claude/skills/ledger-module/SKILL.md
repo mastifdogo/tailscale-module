@@ -119,3 +119,8 @@ Ledger's dashboard, and books the Tailscale subscription.
   `PUT /billing/accounts` (admins). Backups (Ledger ≥ 0.13.0) save each table
   as CSV: keep names plain and secrets out of tables (`settings.api_key` and
   `oauth_client_secret` are only filled until 0.1.0's one-time move).
+- Charges pass `entity_id` for the vendor "Tailscale" (`tailscaleVendor`,
+  `ctx.entities.ensure`, Ledger ≥ 0.16.0; skipped when missing or inactive).
+- Restores (Ledger ≥ 0.14.0) bring back old tables but keep current
+  settings: `moveOldSettings` only fills form values that are still unset or
+  default (`FORM_DEFAULTS` from the manifest), never over what the form holds.
