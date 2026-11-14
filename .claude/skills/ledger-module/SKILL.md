@@ -11,6 +11,15 @@ This repository is a **Ledger module**: `ledger-module.json` (manifest),
 Release of this repository. Ledger itself is
 [mastifdogo/Bookeeping](https://github.com/mastifdogo/Bookeeping).
 
+## When invoked with no instruction
+
+Bring this module up to date with the current Ledger and push it, as Ledger's
+own module skill describes: read the current module API, compare, make the
+changes (raise `"ledger"` and `version` as below), run the checks, commit and
+push `main` (the release workflow publishes it). Say what changed and what
+you left alone and why; if nothing needed changing, say so and push nothing.
+Changes that move the user's data still need their approval in the module.
+
 ## 1. Get a Ledger checkout and read the module API
 
 The API reference and the full workflow live in the Ledger repository.
@@ -44,6 +53,8 @@ feature the module uses (the context file says which version added what;
   no API keys, OAuth, IMAP or Apps Script bridges of the module's own for
   those. The admin allows the module under Settings → AI / Gmail.
 - Bad input answers 4xx (`throw new ctx.HttpError(422, "…")`), never 500.
+- Ledger runs in a Debian 13 container with PostgreSQL 18 (Ledger ≥ 0.18.0):
+  write for that only, call no programs that aren't installed there.
 
 ## 3. Check before saying it works
 
