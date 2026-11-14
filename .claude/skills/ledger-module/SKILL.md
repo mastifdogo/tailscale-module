@@ -94,44 +94,33 @@ leave pushing it to them. The module must work without that change.
 
 ## This module: Tailscale (`id: tailscale`, schema `mod_tailscale`)
 
-Shares Ledger on your tailnet with Tailscale Serve (through the server's own
-tailscaled LocalAPI socket), syncs tailnet devices and users, posts alerts to
-Ledger's dashboard, and books the Tailscale subscription.
+Ledger's connection to the tailnet: shares Ledger with Tailscale Serve through
+the server's own tailscaled LocalAPI socket, and warns on the dashboard if the
+share goes away. Since 0.6.0 it does **not** use the Tailscale API (no
+devices, users, alerts about them, search or billing): the user asked for a
+connection only, so don't add API features back without asking.
 
-- Layout: `server.mjs` (routes, LocalAPI client, sync, charges, settings
-  handling), `lib.mjs` (address detection, Serve config building, probes: no
-  Ledger or tailscaled needed) and `ui/index.html` (builds the DOM with an
+- Layout: `server.mjs` (routes, LocalAPI client, Serve setup, the share
+  check), `lib.mjs` (address detection, Serve config building, probes: no
+  Ledger or tailscaled needed) and `ui/index.html` (one page, built with an
   `h()` helper; API data only ever goes in as text). Tests: `npm test`
   (`node --test`, covers `lib.mjs`).
-- Configuration is the manifest's `settings` (Ledger's form under Settings →
-  Tailscale). The Access tab's Advanced options (address, HTTPS port, socket,
-  plain http) stay in `mod_tailscale.settings` because they go with the
-  share/stop actions. 0.1.0 copied older installs' values into the form once
-  (`moved_to_ledger_settings`).
+- No manifest `settings`: the Serve options (address, HTTPS port, socket,
+  plain http) and `serve_wanted` live in `mod_tailscale.settings` of the main
+  books and are changed on the page's Advanced box.
 - It talks to `tailscaled` on the Ledger server; the checker can't exercise
   those routes without one, so test Serve changes against a real tailscaled or
   the stand-ins in `test/` (`withLedger`, `describeServe`). Changing what it
   shares changes how Ledger is reached: confirm with the user before touching
   Serve defaults.
-- Roles: sharing, stopping, node login and Access → Advanced are admin-only;
-  sync and charges are bookkeeper and up.
-- Organizations: settings are per organization (Ledger ≥ 0.11.1), so read
-  `getSettings()` where values are used. Sync, alerts and billing are per
-  organization; `tick` visits each with `eachOrg`, and a manual sync covers
-  the current one. The Serve options and `serve_wanted` describe the machine:
-  read and written in the main books' copy of `settings` (`inMain`), changed
-  only by main-books admins (`requireServeAdmin`).
-- Charges' journal entries carry a link `charge:<id>` (Ledger ≥ 0.11.2,
-  `chargeLink`); `settlePending` uses `linkedEntries` to finish charges left
-  `pending`, and `linkOldCharges` backfilled links for older charges.
-- Billing accounts: the Billing tab offers Ledger's "+ New account…" dialog
-  (`newAccount()`, the `ledger-new-account` message, Ledger ≥ 0.11.3) for a
-  missing or unsuitable account and saves the result with
-  `PUT /billing/accounts` (admins). Backups (Ledger ≥ 0.13.0) save each table
-  as CSV: keep names plain and secrets out of tables (`settings.api_key` and
-  `oauth_client_secret` are only filled until 0.1.0's one-time move).
-- Charges pass `entity_id` for the vendor "Tailscale" (`tailscaleVendor`,
-  `ctx.entities.ensure`, Ledger ≥ 0.16.0; skipped when missing or inactive).
-- Restores (Ledger ≥ 0.14.0) bring back old tables but keep current
-  settings: `moveOldSettings` only fills form values that are still unset or
-  default (`FORM_DEFAULTS` from the manifest), never over what the form holds.
+- Roles and organizations: the Serve options describe the machine, so they're
+  read and written in the main books (`inMain`) and changed only by admins of
+  the main books (`requireServeAdmin`); `GET /node` reports `can_manage`. The
+  share warning goes to every organization (`eachOrg`).
+- 0.6.0 cleanup (`forgetApiFeatures`, once per organization): clears the old
+  API settings from Ledger's settings store and the old dashboard items;
+  migration 006 dropped the device, user and sync tables and old settings
+  columns. The `charges` table (pre-0.6.0 billing) is kept as history; its
+  journal entries stay in the books with their `charge:<id>` links.
+- Ledger runs it in a Debian 13 container; the module itself installs and
+  runs nothing (the service is sandboxed: no root, read-only system).

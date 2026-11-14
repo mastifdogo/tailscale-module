@@ -1,45 +1,16 @@
 {
   "id": "tailscale",
   "name": "Tailscale",
-  "version": "0.5.0",
-  "description": "Share Ledger on your tailnet via Tailscale Serve; tailnet devices and alerts on the dashboard; Tailscale subscription bookkeeping.",
-  "ledger": ">=0.11.3",
+  "version": "0.6.0",
+  "description": "Ledger's connection to your tailnet: shares Ledger at https://<server>.<tailnet>.ts.net with Tailscale Serve.",
+  "ledger": ">=0.11.1",
   "server": "server.mjs",
   "ui": "ui",
   "nav": {
     "label": "Tailscale",
-    "icon": { "path": "M10 5a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M3 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M17 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M11 6.8L6 16.2 M13 6.8L18 16.2 M7 18H17" }
+    "icon": {
+      "path": "M10 5a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M3 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M17 18a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M11 6.8L6 16.2 M13 6.8L18 16.2 M7 18H17"
+    }
   },
-  "migrations": "migrations",
-  "settings": {
-    "fields": [
-      { "key": "auth_mode", "label": "Tailscale API login", "type": "select", "default": "oauth",
-        "options": [{ "value": "oauth", "label": "OAuth client (recommended)" }, { "value": "api_key", "label": "API access token" }],
-        "help": "Read-only access is enough: scopes devices:core:read and users:read. Only needed for the Devices, Users and Billing tabs." },
-      { "key": "oauth_client_id", "label": "OAuth client ID", "type": "text",
-        "help": "Tailscale admin console → Settings → OAuth clients." },
-      { "key": "oauth_client_secret", "label": "OAuth client secret", "type": "secret",
-        "help": "Starts with tskey-client-." },
-      { "key": "api_key", "label": "API access token", "type": "secret",
-        "help": "Starts with tskey-api-. Tailscale admin console → Settings → Keys. Expires after at most 90 days." },
-      { "key": "tailnet", "label": "Tailnet", "type": "text", "default": "-",
-        "help": "\"-\" means the tailnet the credentials belong to." },
-      { "key": "sync_minutes", "label": "Sync every (minutes)", "type": "number", "min": 0, "max": 1440, "default": 60,
-        "help": "0 turns automatic syncing off." },
-      { "key": "key_expiry_warn_days", "label": "Warn of key expiry (days ahead)", "type": "number", "min": 1, "max": 90, "default": 14 },
-      { "key": "offline_warn_days", "label": "Warn when a device is offline (days)", "type": "number", "min": 0, "max": 365, "default": 30,
-        "help": "0 turns this warning off." },
-      { "key": "billing_enabled", "label": "Record the subscription in the ledger", "type": "boolean", "default": false,
-        "help": "Monthly charge = active users × price per user + flat fee, posted from the Billing tab." },
-      { "key": "price_per_user", "label": "Price per user / month", "type": "text", "default": "6.00",
-        "help": "In the currency below, e.g. 6.00 (Starter) or 18.00 (Premium)." },
-      { "key": "base_fee", "label": "Flat fee / month", "type": "text", "default": "0.00" },
-      { "key": "currency", "label": "Currency", "type": "select", "options": ["USD", "CAD"], "default": "USD" },
-      { "key": "expense_account", "label": "Expense account (debit)", "type": "text",
-        "help": "An active expense account in that currency, e.g. 6400." },
-      { "key": "payment_account", "label": "Paid from (credit)", "type": "text",
-        "help": "An active asset (bank) or liability (credit card) account in that currency, e.g. 2100." },
-      { "key": "bill_day", "label": "Remind me on day of month", "type": "number", "min": 1, "max": 28, "default": 1 }
-    ]
-  }
+  "migrations": "migrations"
 }

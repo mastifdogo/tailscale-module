@@ -33,12 +33,6 @@
 	input, select { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 8px; width: 100%; min-width: 0; }
 	input[type=checkbox] { width: auto; }
 	input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
-	nav { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 14px; overflow-x: auto; }
-	nav button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; white-space: nowrap; color: var(--muted); }
-	nav button[aria-selected=true] { color: var(--text); border-bottom-color: var(--accent); }
-	.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
-	.card { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
-	.card b { display: block; font-size: 22px; }
 	.wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
 	table { border-collapse: collapse; width: 100%; }
 	th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
@@ -53,9 +47,6 @@
 	label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
 	label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 15px; }
 	.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-	.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-	.toolbar input { flex: 1 1 160px; width: auto; }
-	.preview { font-size: 17px; margin: 10px 0; }
 	pre { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
 	.big { font-size: 17px; word-break: break-all; }
 	.steps { padding-left: 20px; } .steps li { margin: 4px 0; }
@@ -65,25 +56,12 @@
 </head>
 <body>
 <main>
-	<header>
-		<h1>Tailscale</h1>
-		<span id="synced" class="muted small"></span>
-		<button id="syncBtn" hidden>Sync now</button>
-	</header>
+	<header><h1>Tailscale</h1></header>
 	<div id="msg" hidden></div>
-	<nav role="tablist" id="tabs">
-		<button role="tab" data-tab="access">Access</button>
-		<button role="tab" data-tab="overview">Overview</button>
-		<button role="tab" data-tab="devices">Devices</button>
-		<button role="tab" data-tab="users">Users</button>
-		<button role="tab" data-tab="billing">Billing</button>
-	</nav>
 	<section id="view"></section>
 </main>
 <script>
 "use strict";
-const SETTINGS_URL = "/settings/m/tailscale";
-
 const api = (path, opts = {}) =>
 	fetch(`/api/v1/m/tailscale${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } })
 		.then(async (r) => {
@@ -120,43 +98,6 @@ const cmd = (text) => h("pre", null, text);
 const badge = (text, cls = "") => h("span", { class: `badge ${cls}` }, text);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-const money = (cents, cur) => `${(Number(cents) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`;
-const short = (n) => String(n || "").split(".")[0];
-function ago(d) {
-	if (!d) return "never";
-	const s = (Date.now() - new Date(d).getTime()) / 1000;
-	const fut = s < 0, a = Math.abs(s);
-	const [n, u] = a < 60 ? [a, "s"] : a < 3600 ? [a / 60, "min"] : a < 86400 ? [a / 3600, "h"] : [a / 86400, "d"];
-	return fut ? `in ${Math.round(n)} ${u}` : `${Math.round(n)} ${u} ago`;
-}
-function table(head, rows, empty) {
-	return h("div", { class: "wrap" }, h("table", null,
-		h("thead", null, h("tr", null, head.map(([text, cls]) => h("th", { class: cls }, text)))),
-		h("tbody", null, rows.length ? rows : h("tr", null, h("td", { colspan: head.length, class: "muted" }, empty)))));
-}
-
-// "+ New account…" (Ledger ≥ 0.11.3): Ledger opens its New account dialog over this
-// page and answers with the account it created, or null if cancelled.
-// (The id uses getRandomValues: crypto.randomUUID only exists on HTTPS pages,
-// and Ledger is often opened over plain http on a LAN or tailnet address.)
-function newAccount(defaults = {}) {
-	const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
-	return new Promise((resolve) => {
-		addEventListener("message", function on(e) {
-			if (e.origin !== location.origin || e.data?.type !== "ledger-new-account-result" || e.data.id !== id) return;
-			removeEventListener("message", on);
-			resolve(e.data.account);
-		});
-		parent.postMessage({ type: "ledger-new-account", id, defaults }, location.origin);
-	});
-}
-
-let state = { status: null, tab: "access", filter: "" };
-try { state.tab = localStorage.getItem("tailscale.tab") || "access"; } catch {}
-const isAdmin = () => state.status?.role === "admin";
-const settingsHint = (what) => isAdmin()
-	? [what, " under ", ledgerLink(SETTINGS_URL, "Settings → Tailscale"), "."]
-	: [what, " under Settings → Tailscale (ask an admin)."];
 
 function flash(text, kind = "danger") {
 	const m = $("#msg");
@@ -166,318 +107,120 @@ function flash(text, kind = "danger") {
 	m.hidden = false;
 }
 
-async function loadStatus() {
-	state.status = await api("/status");
-	const st = state.status, ls = st.last_sync;
-	replace($("#synced"), !st.configured ? "No API credentials"
-		: !ls ? "Never synced"
-		: ls.ok === false ? h("span", { class: "danger" }, `Last sync failed ${ago(ls.started_at)}`)
-		: ls.ok ? `Synced ${ago(ls.finished_at)}` : "Syncing…");
-	$("#syncBtn").hidden = !st.configured || st.role === "viewer";
+async function render(el) {
+	const n = await api("/node");
+	// Sharing is for the whole server: only admins of the main books manage it.
+	const admin = n.can_manage;
+	const out = [h("h2", null, "Ledger on your tailnet"),
+		!admin && n.role === "admin" && h("p", { class: "muted small" }, "Sharing Ledger on the tailnet affects the whole server, so it's managed from the main books by their admins.")];
+	const act = (label, cls, fn, okMsg) => h("button", { class: cls, async onclick(e) {
+		e.target.disabled = true;
+		try { const r = await fn(); if (r === undefined) return show(); if (okMsg) flash(okMsg(r), "ok"); await show(); }
+		catch (err) { flash(err.message); e.target.disabled = false; }
+	} }, label);
+	const recheck = act("Check again", "", async () => flash(""));
+
+	if (!n.reachable && n.not_ready) {
+		out.push(msg("warn", "Tailscale is installed and running on the Ledger server, but its service hasn't started properly."),
+			h("ol", { class: "steps" },
+				h("li", null, "If it was just installed or restarted, wait a few seconds and check again."),
+				h("li", null, "Look at its log for the cause: ", cmd("sudo journalctl -u tailscaled -n 50 --no-pager")),
+				h("li", null, "If the log mentions /dev/net/tun (common in LXC containers), run it in userspace mode, which Tailscale Serve supports:",
+					cmd(`echo 'FLAGS="--tun=userspace-networking"' | sudo tee -a /etc/default/tailscaled\nsudo systemctl restart tailscaled\nsudo tailscale up`))),
+			h("p", { class: "muted small" }, n.error), recheck);
+	} else if (!n.reachable) {
+		out.push(msg("warn", n.error),
+			h("p", null, "To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:"),
+			h("ol", { class: "steps" },
+				h("li", null, "Install Tailscale: ", cmd("curl -fsSL https://tailscale.com/install.sh | sh")),
+				h("li", null, "Join your tailnet: ", cmd("sudo tailscale up")),
+				h("li", null, "Let Ledger manage Tailscale Serve: ", cmd(`sudo tailscale set --operator=${n.process_user}`))),
+			recheck);
+	} else if (n.backend_state !== "Running") {
+		out.push(h("p", null, "Tailscale is installed on the Ledger server but not connected (", h("b", null, n.backend_state), ")."),
+			n.auth_url && h("p", null, ext(n.auth_url, "Approve this server in Tailscale ↗", "big")),
+			h("div", { class: "row" },
+				admin && act("Log this server in", "primary", async () => {
+					const r = await api("/node/login", { method: "POST", body: "{}" });
+					if (r.auth_url) window.open(r.auth_url, "_blank", "noopener");
+				}),
+				recheck),
+			h("p", { class: "muted small" }, "Or on the server: sudo tailscale up"));
+	} else {
+		const self = n.self || {};
+		out.push(h("p", null, "This server is ", h("b", null, self.host_name), " on tailnet ", h("b", null, n.tailnet), " ",
+			h("span", { class: "muted" }, `(${(self.ips || []).join(", ")})`), "."));
+		const shownTarget = n.target.replace("https+insecure", "https");
+		if (n.serving) {
+			const tc = n.target_check;
+			out.push(msg("ok", "Ledger is shared with your tailnet at", h("br"), ext(n.url, n.url, "big"),
+				n.http_url && [h("br"), h("span", { class: "small" }, "and ", ext(n.http_url, n.http_url),
+					n.http_mode === "redirect" ? " (redirects to https)" : "")]));
+			if (n.http_wanted && !n.http_url) {
+				out.push(msg("warn", `Plain http:// isn't set up${n.http_conflict ? `: ${n.http_conflict}` : ""}. `,
+					admin && act("Set it up", "link", () => api("/node/serve", { method: "POST", body: "{}" }),
+						(r) => (r.http_url ? `Ledger also answers at ${r.http_url}` : "Updated."))));
+			}
+			if (n.http_mode === "proxy") {
+				out.push(h("p", { class: "muted small" }, `Your Tailscale (${(n.version || "").split("-")[0]}) can't redirect, so http:// serves Ledger directly. Update Tailscale to 1.92 or later to redirect to https instead.`));
+			}
+			if (n.funnel) out.push(msg("danger", "Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with  tailscale funnel reset  unless that's intended."));
+			if (tc && !tc.ok) out.push(msg("danger", `Tailscale forwards to ${shownTarget}, but Ledger isn't reachable there: ${tc.reason}. Visitors get “502”. Fix the address under Advanced (stop sharing first).`));
+			if (tc && tc.ok && !tc.ledger) out.push(msg("danger", `${shownTarget} answers (HTTP ${tc.status}) but it isn't Ledger. Fix the address under Advanced (stop sharing first).`));
+			out.push(h("p", { class: "muted small" }, "Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual."),
+				admin && act("Stop sharing", "", async () => {
+					if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) return;
+					return api("/node/serve", { method: "DELETE" });
+				}, () => "Ledger is no longer shared on the tailnet."));
+		} else {
+			const problems = [
+				n.magic_dns === false && "Turn on MagicDNS in the Tailscale admin console (DNS page).",
+				!n.https_enabled && "Turn on HTTPS Certificates in the Tailscale admin console (DNS page).",
+				n.conflict && `${n.conflict}. Choose another HTTPS port under Advanced.`,
+				n.serve_error,
+			].filter(Boolean);
+			const https = `https://${self.dns_name}${n.port === 443 ? "" : ":" + n.port}/`;
+			out.push(n.wanted && msg("warn", "Ledger was shared on the tailnet but isn't any more."),
+				problems.map((p) => msg("warn", p)),
+				h("p", null, "Share Ledger with your tailnet over HTTPS at ", h("b", null, https),
+					n.http_wanted ? [" (and ", h("b", null, `http://${self.dns_name}/`), n.http_redirect_supported ? ", which redirects there" : "", ")"] : "",
+					" using Tailscale Serve. It is not exposed to the internet."),
+				admin ? act("Share Ledger on the tailnet", "primary", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`)
+					: h("p", { class: "muted" }, "An admin of the main books can share it from here."));
+		}
+	}
+
+	if (admin) {
+		const f = h("form", { class: "grid", async onsubmit(e) {
+			e.preventDefault();
+			try {
+				await api("/node/settings", { method: "PUT", body: JSON.stringify({
+					serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value),
+					socket_path: f.socket_path.value.trim(), serve_http: f.serve_http.checked }) });
+				flash("Saved.", "ok"); await show();
+			} catch (err) { flash(err.message); }
+		} },
+			h("label", null, "Ledger address on this server",
+				h("input", { name: "serve_target", value: n.target_is_default ? "" : n.target.replace("https+insecure", "https"), placeholder: n.target }),
+				h("span", { class: "muted small" }, n.detected_targets?.length
+					? `Detected: ${n.detected_targets.join(", ")}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000).")),
+			h("label", null, "HTTPS port", h("select", { name: "serve_port" },
+				[443, 8443, 10000].map((p) => h("option", { value: p, selected: p === n.port }, p)))),
+			h("label", null, "tailscaled socket", h("input", { name: "socket_path", value: n.socket_path })),
+			h("label", { class: "check" }, h("input", { type: "checkbox", name: "serve_http", checked: n.http_wanted }), "Also answer plain http://"),
+			h("div", null, h("button", null, "Save")));
+		out.push(h("details", null, h("summary", { class: "muted" }, "Advanced"), h("div", { style: "margin-top:10px" }, f),
+			h("p", { class: "muted small" }, `Ledger runs as ${n.process_user}`, n.version ? ` · Tailscale ${n.version.split("-")[0]}` : "", ".")));
+	}
+	replace(el, out);
 }
 
-const views = {
-	async access(el) {
-		const n = await api("/node");
-		// Sharing is for the whole server: only admins of the main books manage it.
-		const admin = n.can_manage;
-		const out = [h("h2", null, "Ledger on your tailnet"),
-			!admin && isAdmin() && h("p", { class: "muted small" }, "Sharing Ledger on the tailnet affects the whole server, so it's managed from the main books by their admins.")];
-		const act = (label, cls, fn, okMsg) => h("button", { class: cls, async onclick(e) {
-			e.target.disabled = true;
-			try { const r = await fn(); if (r === undefined) return show("access"); if (okMsg) flash(okMsg(r), "ok"); await show("access"); }
-			catch (err) { flash(err.message); e.target.disabled = false; }
-		} }, label);
-		const recheck = act("Check again", "", async () => flash(""));
-
-		if (!n.reachable && n.not_ready) {
-			out.push(msg("warn", "Tailscale is installed and running on the Ledger server, but its service hasn't started properly."),
-				h("ol", { class: "steps" },
-					h("li", null, "If it was just installed or restarted, wait a few seconds and check again."),
-					h("li", null, "Look at its log for the cause: ", cmd("sudo journalctl -u tailscaled -n 50 --no-pager")),
-					h("li", null, "If the log mentions /dev/net/tun (common in LXC containers), run it in userspace mode, which Tailscale Serve supports:",
-						cmd(`echo 'FLAGS="--tun=userspace-networking"' | sudo tee -a /etc/default/tailscaled\nsudo systemctl restart tailscaled\nsudo tailscale up`))),
-				h("p", { class: "muted small" }, n.error), recheck);
-		} else if (!n.reachable) {
-			out.push(msg("warn", n.error),
-				h("p", null, "To reach Ledger over Tailscale, this server must be on your tailnet. On the Ledger server:"),
-				h("ol", { class: "steps" },
-					h("li", null, "Install Tailscale: ", cmd("curl -fsSL https://tailscale.com/install.sh | sh")),
-					h("li", null, "Join your tailnet: ", cmd("sudo tailscale up")),
-					h("li", null, "Let Ledger manage Tailscale Serve: ", cmd(`sudo tailscale set --operator=${n.process_user}`))),
-				recheck);
-		} else if (n.backend_state !== "Running") {
-			out.push(h("p", null, "Tailscale is installed on the Ledger server but not connected (", h("b", null, n.backend_state), ")."),
-				n.auth_url && h("p", null, ext(n.auth_url, "Approve this server in Tailscale ↗", "big")),
-				h("div", { class: "row" },
-					admin && act("Log this server in", "primary", async () => {
-						const r = await api("/node/login", { method: "POST", body: "{}" });
-						if (r.auth_url) window.open(r.auth_url, "_blank", "noopener");
-					}),
-					recheck),
-				h("p", { class: "muted small" }, "Or on the server: sudo tailscale up"));
-		} else {
-			const self = n.self || {};
-			out.push(h("p", null, "This server is ", h("b", null, self.host_name), " on tailnet ", h("b", null, n.tailnet), " ",
-				h("span", { class: "muted" }, `(${(self.ips || []).join(", ")})`), "."));
-			const shownTarget = n.target.replace("https+insecure", "https");
-			if (n.serving) {
-				const tc = n.target_check;
-				out.push(msg("ok", "Ledger is shared with your tailnet at", h("br"), ext(n.url, n.url, "big"),
-					n.http_url && [h("br"), h("span", { class: "small" }, "and ", ext(n.http_url, n.http_url),
-						n.http_mode === "redirect" ? " (redirects to https)" : "")]));
-				if (n.http_wanted && !n.http_url) {
-					out.push(msg("warn", `Plain http:// isn't set up${n.http_conflict ? `: ${n.http_conflict}` : ""}. `,
-						admin && act("Set it up", "link", () => api("/node/serve", { method: "POST", body: "{}" }),
-							(r) => (r.http_url ? `Ledger also answers at ${r.http_url}` : "Updated."))));
-				}
-				if (n.http_mode === "proxy") {
-					out.push(h("p", { class: "muted small" }, `Your Tailscale (${(n.version || "").split("-")[0]}) can't redirect, so http:// serves Ledger directly. Update Tailscale to 1.92 or later to redirect to https instead.`));
-				}
-				if (n.funnel) out.push(msg("danger", "Tailscale Funnel is on for this address: Ledger is reachable from the public internet. Turn it off with  tailscale funnel reset  unless that's intended."));
-				if (tc && !tc.ok) out.push(msg("danger", `Tailscale forwards to ${shownTarget}, but Ledger isn't reachable there: ${tc.reason}. Visitors get “502”. Fix the address under Advanced (stop sharing first).`));
-				if (tc && tc.ok && !tc.ledger) out.push(msg("danger", `${shownTarget} answers (HTTP ${tc.status}) but it isn't Ledger. Fix the address under Advanced (stop sharing first).`));
-				out.push(h("p", { class: "muted small" }, "Only devices on your tailnet (subject to your ACLs) can open it; everyone still signs in to Ledger as usual."),
-					admin && act("Stop sharing", "", async () => {
-						if (!confirm("Stop sharing Ledger on the tailnet? Anyone using the tailnet address loses access.")) return;
-						return api("/node/serve", { method: "DELETE" });
-					}, () => "Ledger is no longer shared on the tailnet."));
-			} else {
-				const problems = [
-					n.magic_dns === false && "Turn on MagicDNS in the Tailscale admin console (DNS page).",
-					!n.https_enabled && "Turn on HTTPS Certificates in the Tailscale admin console (DNS page).",
-					n.conflict && `${n.conflict}. Choose another HTTPS port under Advanced.`,
-					n.serve_error,
-				].filter(Boolean);
-				const https = `https://${self.dns_name}${n.port === 443 ? "" : ":" + n.port}/`;
-				out.push(n.wanted && msg("warn", "Ledger was shared on the tailnet but isn't any more."),
-					problems.map((p) => msg("warn", p)),
-					h("p", null, "Share Ledger with your tailnet over HTTPS at ", h("b", null, https),
-						n.http_wanted ? [" (and ", h("b", null, `http://${self.dns_name}/`), n.http_redirect_supported ? ", which redirects there" : "", ")"] : "",
-						" using Tailscale Serve. It is not exposed to the internet."),
-					admin ? act("Share Ledger on the tailnet", "primary", () => api("/node/serve", { method: "POST", body: "{}" }), (r) => `Ledger is now at ${r.url}`)
-						: h("p", { class: "muted" }, "An admin of the main books can share it from here."));
-			}
-		}
-
-		if (admin) {
-			const f = h("form", { class: "grid", async onsubmit(e) {
-				e.preventDefault();
-				try {
-					await api("/node/settings", { method: "PUT", body: JSON.stringify({
-						serve_target: f.serve_target.value.trim() || null, serve_port: Number(f.serve_port.value),
-						socket_path: f.socket_path.value.trim(), serve_http: f.serve_http.checked }) });
-					flash("Saved.", "ok"); await show("access");
-				} catch (err) { flash(err.message); }
-			} },
-				h("label", null, "Ledger address on this server",
-					h("input", { name: "serve_target", value: n.target_is_default ? "" : n.target.replace("https+insecure", "https"), placeholder: n.target }),
-					h("span", { class: "muted small" }, n.detected_targets?.length
-						? `Detected: ${n.detected_targets.join(", ")}. Leave blank to use it.` : "A port (3000) or address (127.0.0.1:3000).")),
-				h("label", null, "HTTPS port", h("select", { name: "serve_port" },
-					[443, 8443, 10000].map((p) => h("option", { value: p, selected: p === n.port }, p)))),
-				h("label", null, "tailscaled socket", h("input", { name: "socket_path", value: n.socket_path })),
-				h("label", { class: "check" }, h("input", { type: "checkbox", name: "serve_http", checked: n.http_wanted }), "Also answer plain http://"),
-				h("div", null, h("button", null, "Save")));
-			out.push(h("details", null, h("summary", { class: "muted" }, "Advanced"), h("div", { style: "margin-top:10px" }, f),
-				h("p", { class: "muted small" }, `Ledger runs as ${n.process_user}`, n.version ? ` · Tailscale ${n.version.split("-")[0]}` : "", ".")));
-		}
-		replace(el, out);
-	},
-
-	async overview(el) {
-		const st = state.status, c = st.counts;
-		if (!st.configured) {
-			replace(el, h("p", null, ...settingsHint("To see your tailnet's devices and users here, add Tailscale API credentials")));
-			return;
-		}
-		const ls = st.last_sync;
-		const devices = await api("/devices");
-		const days = st.settings.key_expiry_warn_days;
-		const soon = devices.filter((d) => d.expires && new Date(d.expires) < Date.now() + days * 864e5)
-			.sort((a, b) => new Date(a.expires) - new Date(b.expires));
-		const card = (n, label, cls) => h("div", { class: "card" }, h("b", { class: cls }, n), h("span", { class: "muted" }, label));
-		replace(el,
-			st.problems.map((p) => msg("warn", ...settingsHint(p))),
-			ls?.ok === false && msg("danger", ls.error),
-			ls?.warning && msg("warn", ls.warning),
-			h("div", { class: "cards" },
-				card(c.devices, "devices"), card(c.online, "online", "ok"), card(c.expiring, "keys expiring", c.expiring ? "warn" : ""),
-				card(c.updates, "updates available"), card(c.users, "users"), card(c.seats, "billable seats")),
-			h("h2", null, `Keys expiring within ${days} days`),
-			soon.length ? table([["Device"], ["User", "opt"], ["Expires"]], soon.map((d) => h("tr", null,
-				h("td", null, short(d.name)), h("td", { class: "opt" }, d.user_login),
-				h("td", { class: new Date(d.expires) < Date.now() ? "danger" : "warn" }, ago(d.expires)))), "")
-				: h("p", { class: "muted" }, "None."),
-			st.settings.billing_enabled && [h("h2", null, `Billing ${st.period}`), h("p", null, st.period_charge
-				? `Recorded: ${money(st.period_charge.total_cents, st.period_charge.currency)} (${st.period_charge.status})`
-				: [h("span", { class: "warn" }, "Not recorded yet. "), h("button", { class: "link", onclick: () => show("billing") }, "Record it")])],
-			h("p", { class: "muted small" }, ext("https://login.tailscale.com/admin/machines", "Open the Tailscale admin console ↗")));
-	},
-
-	async devices(el) {
-		const devices = await api("/devices");
-		const days = state.status.settings.key_expiry_warn_days;
-		const tbody = h("tbody"), count = h("p", { class: "muted small" });
-		const render = () => {
-			const f = state.filter.toLowerCase();
-			const list = devices.filter((d) => !f || [d.name, d.hostname, d.user_login, d.os, d.client_version, ...d.addresses, ...d.tags]
-				.some((v) => String(v || "").toLowerCase().includes(f)));
-			replace(tbody, list.length ? list.map((d) => {
-				const exp = d.expires ? new Date(d.expires) : null;
-				const expCls = exp && exp < Date.now() ? "danger" : exp && exp < Date.now() + days * 864e5 ? "warn" : "";
-				return h("tr", null,
-					h("td", null, short(d.name), " ",
-						!d.authorized && badge("needs approval", "warn"), d.is_external && badge("shared in"),
-						d.update_available && badge("update"), d.tags.map((t) => badge(t, "muted"))),
-					h("td", { class: "opt" }, d.user_login),
-					h("td", { class: "opt" }, d.os, " ", h("span", { class: "muted small" }, (d.client_version || "").split("-")[0])),
-					h("td", { class: "opt" }, d.addresses[0] || ""),
-					h("td", null, d.connected ? h("span", { class: "ok" }, "● online") : ago(d.last_seen)),
-					h("td", { class: `opt ${expCls}` }, d.key_expiry_disabled ? h("span", { class: "muted" }, "disabled") : exp ? ago(d.expires) : "—"));
-			}) : h("tr", null, h("td", { colspan: 6, class: "muted" }, "No devices.")));
-			count.textContent = `${list.length} of ${devices.length} devices`;
-		};
-		replace(el,
-			h("div", { class: "toolbar" }, h("input", { type: "search", placeholder: "Filter by name, user, OS, IP, tag", value: state.filter,
-				oninput: (e) => { state.filter = e.target.value; render(); } })),
-			h("div", { class: "wrap" }, h("table", null, h("thead", null, h("tr", null,
-				h("th", null, "Device"), h("th", { class: "opt" }, "User"), h("th", { class: "opt" }, "OS"),
-				h("th", { class: "opt" }, "Address"), h("th", null, "Last seen"), h("th", { class: "opt" }, "Key expiry"))), tbody)),
-			count);
-		render();
-	},
-
-	async users(el) {
-		const users = await api("/users");
-		const cls = { active: "ok", idle: "muted", suspended: "danger", "needs-approval": "warn" };
-		if (!users.length) {
-			replace(el, h("p", { class: "muted" }, "No users synced. ", state.status.last_sync?.warning || ""));
-			return;
-		}
-		replace(el,
-			table([["User"], ["Role", "opt"], ["Status"], ["Devices", "num"], ["Last seen", "opt"]], users.map((u) => h("tr", null,
-				h("td", null, u.display_name || u.login_name, h("div", { class: "muted small" }, u.login_name)),
-				h("td", { class: "opt" }, u.role, u.type === "shared" && [" ", badge("shared")]),
-				h("td", null, badge(u.status, cls[u.status] || ""), u.type === "member" && u.status === "active" && [" ", badge("billable", "muted")]),
-				h("td", { class: "num" }, u.device_count ?? ""),
-				h("td", { class: "opt" }, u.connected ? h("span", { class: "ok" }, "● online") : ago(u.last_seen)))), ""),
-			h("p", { class: "muted small" }, "Billable seats = members with status “active”. Shared-in users and idle or suspended members are not counted."));
-	},
-
-	async billing(el) {
-		const st = state.status, s = st.settings;
-		const charges = await api("/charges");
-		const canPost = st.role !== "viewer";
-		const history = [h("h2", null, "History"), charges.length
-			? table([["Month"], ["Seats", "num opt"], ["Total", "num"], ["Status"], ["Entry", "opt"], [""]], charges.map((c) => h("tr", null,
-				h("td", null, c.period, h("div", { class: "muted small" }, c.entry_date)),
-				h("td", { class: "num opt" }, c.seats),
-				h("td", { class: "num" }, money(c.total_cents, c.currency)),
-				h("td", null, badge(c.status, c.status === "posted" ? "ok" : c.status === "reversed" ? "muted" : "warn")),
-				h("td", { class: "opt" }, c.entry_id ? `#${c.entry_id}` : "", c.reversal_entry_id ? ` → #${c.reversal_entry_id}` : ""),
-				h("td", null, canPost && c.status === "posted" && h("button", { class: "link", async onclick() {
-					if (!confirm("Post a reversing journal entry for this charge?")) return;
-					try { await api(`/charges/${c.id}/reverse`, { method: "POST", body: "{}" }); flash("Charge reversed.", "ok"); await refresh(); }
-					catch (err) { flash(err.message); }
-				} }, "Reverse"),
-				canPost && c.status === "pending" && h("button", { class: "link", async onclick() {
-					if (!confirm("Discard this pending charge? Its journal entry was never posted.")) return;
-					try { await api(`/charges/${c.id}`, { method: "DELETE" }); await refresh(); }
-					catch (err) { flash(err.message); }
-				} }, "Discard")))), "")
-			: h("p", { class: "muted" }, "No charges recorded yet.")];
-
-		if (!s.billing_enabled) {
-			replace(el, h("p", null, ...settingsHint("To record the monthly Tailscale subscription as a journal entry, turn on billing")), history);
-			return;
-		}
-		if (st.billing_problems.length || !canPost) {
-			const accounts = st.billing_accounts || {};
-			const accountProblems = new Set(Object.values(accounts).map((a) => a.problem).filter(Boolean));
-			// Admins can make a missing account right here and have it saved into the settings.
-			const newAccountButton = (role) => {
-				const a = accounts[role];
-				const missing = a.code && a.problem.endsWith("does not exist");
-				const defaults = role === "expense"
-					? { name: "Software subscriptions", type: "expense", currency: s.currency, description: "Tailscale and other software" }
-					: { name: "Credit card", type: "liability", currency: s.currency };
-				if (missing) defaults.code = a.code;
-				return h("button", { class: "link", async onclick() {
-					const created = await newAccount(defaults);
-					if (!created) return;
-					try {
-						await api("/billing/accounts", { method: "PUT", body: JSON.stringify({ [`${role}_account`]: created.code }) });
-						flash(`Created ${created.code} · ${created.name} and set it as the ${role} account.`, "ok");
-						await refresh();
-					} catch (err) { flash(err.message); }
-				} }, "+ New account…");
-			};
-			replace(el,
-				Object.entries(accounts).filter(([, a]) => a.problem).map(([role, a]) =>
-					msg("warn", ...settingsHint(a.problem), isAdmin() && [" ", newAccountButton(role)])),
-				st.billing_problems.filter((p) => !accountProblems.has(p)).map((p) => msg("warn", ...settingsHint(p))),
-				!canPost && h("p", { class: "muted" }, "Viewers can't post charges."), history);
-			return;
-		}
-		const preview = h("p", { class: "preview" });
-		const f = h("form", { async onsubmit(e) {
-			e.preventDefault();
-			const btn = f.querySelector("button");
-			btn.disabled = true;
-			try {
-				const c = await api("/charges", { method: "POST", body: JSON.stringify({
-					period: f.period.value, entry_date: f.entry_date.value, seats: Number(f.seats.value), memo: f.memo.value || null }) });
-				flash(`Posted journal entry #${c.entry_id} for ${money(c.total_cents, c.currency)}.`, "ok");
-				await refresh();
-			} catch (err) { flash(err.message); btn.disabled = false; }
-		} },
-			h("div", { class: "grid" },
-				h("label", null, "Month", h("input", { name: "period", type: "month", required: true, value: st.period })),
-				h("label", null, "Entry date", h("input", { name: "entry_date", type: "date", required: true, value: st.today })),
-				h("label", null, "Seats", h("input", { name: "seats", type: "number", min: 0, max: 100000, step: 1, required: true, value: st.counts.seats,
-					oninput: () => updatePreview() })),
-				h("label", null, "Memo (optional)", h("input", { name: "memo", maxLength: 200 }))),
-			preview,
-			h("p", { class: "muted small" }, `Debit ${s.expense_account} · Credit ${s.payment_account} · reference tailscale:<month>`),
-			h("button", { class: "primary" }, "Post charge"));
-		const updatePreview = () => {
-			const seats = Math.max(0, Math.trunc(Number(f.seats.value) || 0));
-			const total = seats * Number(s.price_per_user_cents) + Number(s.base_fee_cents);
-			replace(preview, `${seats} × ${money(s.price_per_user_cents, s.currency)}`,
-				Number(s.base_fee_cents) ? ` + ${money(s.base_fee_cents, s.currency)}` : "", " = ", h("b", null, money(total, s.currency)));
-		};
-		updatePreview();
-		replace(el, f, history);
-	},
-};
-
-async function show(tab) {
-	state.tab = views[tab] ? tab : "access";
-	try { localStorage.setItem("tailscale.tab", state.tab); } catch {}
-	document.querySelectorAll("#tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === state.tab)));
+async function show() {
 	const el = $("#view");
-	try { await views[state.tab](el); }
+	try { await render(el); }
 	catch (err) { el.replaceChildren(); flash(err.message); }
 }
-
-async function refresh() {
-	await loadStatus();
-	await show(state.tab);
-}
-
-$("#tabs").onclick = (e) => { const t = e.target.closest("[data-tab]"); if (t) { flash(""); show(t.dataset.tab); } };
-$("#syncBtn").onclick = async () => {
-	const b = $("#syncBtn");
-	b.disabled = true; b.textContent = "Syncing…";
-	try {
-		const r = await api("/sync", { method: "POST", body: "{}" });
-		flash(r.warning ? r.warning : "", "warn");
-	} catch (err) { flash(err.message); }
-	b.disabled = false; b.textContent = "Sync now";
-	await refresh().catch((err) => flash(err.message));
-};
-refresh().catch((err) => flash(err.message));
+show();
 </script>
 </body>
 </html>

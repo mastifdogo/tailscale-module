@@ -10,22 +10,6 @@ export const SERVE_PORTS = [443, 8443, 10000]; // the ports Tailscale Serve acce
 export const HTTP_PORT = 80;
 export const REDIRECT_SINCE = [1, 92, 0]; // first tailscaled whose Serve handlers support Redirect
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-
-export const pad = (n) => String(n).padStart(2, "0");
-export const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-export const isRealDate = (s) => DATE_RE.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
-export const listNames = (names, max = 8) =>
-	names.slice(0, max).join(", ") + (names.length > max ? ` and ${names.length - max} more` : "");
-export const shortName = (n) => String(n).split(".")[0];
-
-// "6", "6.5", "6.00" → 600 cents; null if it isn't an amount.
-export function toCents(v) {
-	const m = /^\s*(\d{1,7})(?:\.(\d{1,2}))?\s*$/.exec(String(v ?? ""));
-	return m ? Number(m[1]) * 100 + Number((m[2] ?? "0").padEnd(2, "0")) : null;
-}
-export const centsToText = (c) => `${BigInt(c) / 100n}.${pad(BigInt(c) % 100n)}`;
-
 export function versionAtLeast(version, min) {
 	const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
 	if (!m) return false;

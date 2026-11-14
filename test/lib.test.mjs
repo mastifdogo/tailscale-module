@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
 import {
-	ServeConflict, centsToText, describeServe, httpProbe, httpsRedirect, normalizeTarget, procAddr, toCents,
-	versionAtLeast, withLedger, withoutLedger,
+	ServeConflict, describeServe, httpProbe, httpsRedirect, normalizeTarget, procAddr, versionAtLeast, withLedger,
+	withoutLedger,
 } from "../lib.mjs";
 
 const DNS = "bookeeping.tail5dab4b.ts.net";
@@ -31,16 +31,6 @@ test("normalizeTarget accepts addresses on this machine only", () => {
 	for (const bad of ["10.9.9.9:80", "example.com:80", "http://127.0.0.1:80/ledger", "ftp://127.0.0.1:21", "127.0.0.1:99999", "file:///etc/passwd"]) {
 		assert.equal(normalizeTarget(bad, own), null, bad);
 	}
-});
-
-test("money helpers", () => {
-	assert.equal(toCents("6"), 600);
-	assert.equal(toCents("6.5"), 650);
-	assert.equal(toCents(" 18.00 "), 1800);
-	assert.equal(toCents("6,00"), null);
-	assert.equal(toCents("-1"), null);
-	assert.equal(centsToText(600n), "6.00");
-	assert.equal(centsToText(5), "0.05");
 });
 
 test("versionAtLeast", () => {

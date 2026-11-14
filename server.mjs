@@ -1,64 +1,25 @@
-// Tailscale module for Ledger: publishes Ledger on the tailnet through the
-// server's own tailscaled (Tailscale Serve, via its LocalAPI socket), syncs the
-// tailnet's devices and users from the Tailscale API, raises dashboard alerts
-// (expiring keys, offline machines, pending approvals, client updates) and
-// records the monthly subscription as a balanced journal entry.
+// Tailscale module for Ledger: Ledger's connection to your tailnet. It shares
+// Ledger at https://<server>.<tailnet>.ts.net through Tailscale Serve, driving
+// the server's own tailscaled over its LocalAPI socket, and warns on the
+// dashboard when that share goes away. It doesn't call the Tailscale API.
 //
-// Configuration lives in Ledger's settings form for this module (manifest
-// "settings"), except the Serve options on the Access tab, which go with the
-// share/stop actions and are kept in mod_tailscale.settings of the main books:
-// they describe this machine, not an organization, so only an admin of the
-// main books may change them.
-//
-// Organizations (Ledger 0.11.1): every organization has its own copy of the
-// module's tables and its own settings, so it has its own Tailscale
-// credentials, sync, alerts and billing. Background work visits each one.
+// The Serve options (Access → Advanced) and whether Ledger should be shared
+// live in mod_tailscale.settings of the main books: they describe this
+// machine, not an organization, so only an admin of the main books changes
+// them. The warning goes to every organization's dashboard.
 
-import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import {
-	SERVE_PORTS, REDIRECT_SINCE, ServeConflict, centsToText, describeServe, hostFor, httpProbe, isRealDate,
-	listNames, localDate, normalizeTarget, ownListeners, pad, serveUrl, shortName, toCents, versionAtLeast,
-	withLedger, withoutLedger,
+	REDIRECT_SINCE, SERVE_PORTS, ServeConflict, describeServe, hostFor, httpProbe, normalizeTarget, ownListeners,
+	serveUrl, versionAtLeast, withLedger, withoutLedger,
 } from "./lib.mjs";
 
-// The settings form's defaults, straight from the manifest.
-const FORM_DEFAULTS = Object.fromEntries(
-	JSON.parse(fs.readFileSync(new URL("./ledger-module.json", import.meta.url), "utf8"))
-		.settings.fields.map((f) => [f.key, f.default ?? null]),
-);
-const CREDENTIAL_KEYS = ["auth_mode", "api_key", "oauth_client_id", "oauth_client_secret"];
-const VENDOR_NAME = "Tailscale";
-
-const API = "https://api.tailscale.com/api/v2";
 const SOCKET_RE = /^\/[A-Za-z0-9._/-]{1,200}$/;
 const TIMEOUT_MS = 10_000;
 const LINK = "/apps/tailscale";
-const SETTINGS_LINK = "Settings → Tailscale";
-const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
-const KEY_RE = /^tskey-[A-Za-z0-9_-]{8,300}$/;
-const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,200}$/;
-const TAILNET_RE = /^[A-Za-z0-9._@-]{1,200}$/;
-const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-
-// Snapshot columns and their types for jsonb_to_recordset.
-const DEVICE_COLS = {
-	id: "text", name: "text", hostname: "text", os: "text", user_login: "text", addresses: "jsonb",
-	client_version: "text", update_available: "boolean", authorized: "boolean", is_external: "boolean",
-	tags: "jsonb", created: "timestamptz", last_seen: "timestamptz", expires: "timestamptz",
-	key_expiry_disabled: "boolean", connected: "boolean",
-};
-const USER_COLS = {
-	id: "text", login_name: "text", display_name: "text", type: "text", role: "text", status: "text",
-	device_count: "int", last_seen: "timestamptz", connected: "boolean", created: "timestamptz",
-};
-
-// Tailscale uses 0001-01-01T00:00:00Z for "never".
-const ts = (v) => (typeof v === "string" && v && !v.startsWith("0001-") ? v : null);
-const str = (v) => (typeof v === "string" ? v : v == null ? null : String(v));
-const strList = (v) => (Array.isArray(v) ? v.map(String) : []);
-const wholeNumber = (v, def, min, max) => (Number.isFinite(v) ? Math.min(max, Math.max(min, Math.trunc(v))) : def);
+// Dashboard items earlier versions (device alerts, billing) left behind.
+const OLD_NOTIFICATIONS = ["sync-error", "key-expiry", "offline", "updates", "approval"];
 
 /** @param {any} ctx */
 export default async function register(ctx) {
@@ -85,11 +46,6 @@ export default async function register(ctx) {
 		if (req.user.role !== "admin") throw new ctx.HttpError(403, `Only an admin can ${what}`);
 		if ((await currentOrgId()) !== 1) throw new ctx.HttpError(403, `Switch to the main books to ${what}`);
 	};
-	/** OAuth access tokens by client id. @type {Map<string, { value: string, exp: number }>} */
-	const oauthTokens = new Map();
-	/** The sync in progress per organization id. @type {Map<number, Promise<any>>} */
-	const running = new Map();
-	let lastBillingCheck = 0;
 
 	// The organization the caller works in (1 = main books, also for background work).
 	const currentOrgId = async () => (ctx.orgs ? (await ctx.orgs.current()).id : 1);
@@ -136,641 +92,23 @@ export default async function register(ctx) {
 
 	// ---------------------------------------------------------------- settings
 
-	/**
-	 * Everything the module is configured with: the values from Ledger's
-	 * settings form, made safe to use, plus the Serve options. `problems` says
-	 * what in the form needs fixing.
-	 */
-	async function getSettings() {
-		const [v, { rows: [local] }] = await Promise.all([
-			ctx.settings.get(),
-			inMain(() => ctx.db.query(`SELECT socket_path, serve_target, serve_port, serve_http, serve_wanted FROM ${S}.settings WHERE id`)),
-		]);
-		const problems = [];
-		const text = (k) => (typeof v[k] === "string" ? v[k].trim() : "");
-		let tailnet = text("tailnet") || "-";
-		if (!TAILNET_RE.test(tailnet)) {
-			problems.push(`Tailnet "${tailnet.slice(0, 60)}" isn't a tailnet name: use "-" for the credentials' own tailnet`);
-			tailnet = "-";
-		}
-		const s = {
-			...local,
-			tailnet,
-			auth_mode: v.auth_mode === "api_key" ? "api_key" : "oauth",
-			api_key: text("api_key") || null,
-			oauth_client_id: text("oauth_client_id") || null,
-			oauth_client_secret: text("oauth_client_secret") || null,
-			sync_minutes: wholeNumber(v.sync_minutes, 60, 0, 1440),
-			key_expiry_warn_days: wholeNumber(v.key_expiry_warn_days, 14, 1, 90),
-			offline_warn_days: wholeNumber(v.offline_warn_days, 30, 0, 365),
-			billing_enabled: v.billing_enabled === true,
-			price_per_user_cents: toCents(text("price_per_user") || "0"),
-			base_fee_cents: toCents(text("base_fee") || "0"),
-			currency: v.currency === "CAD" ? "CAD" : "USD",
-			expense_account: text("expense_account") || null,
-			payment_account: text("payment_account") || null,
-			bill_day: wholeNumber(v.bill_day, 1, 1, 28),
-			problems,
-		};
-		if (s.sync_minutes > 0 && s.sync_minutes < 5) s.sync_minutes = 5;
-		if (s.auth_mode === "api_key" && s.api_key && !KEY_RE.test(s.api_key)) {
-			problems.push("The API access token doesn't look like a Tailscale key (tskey-api-…)");
-		}
-		if (s.auth_mode === "oauth" && s.oauth_client_secret && !KEY_RE.test(s.oauth_client_secret)) {
-			problems.push("The OAuth client secret doesn't look like a Tailscale key (tskey-client-…)");
-		}
-		if (s.oauth_client_id && !CLIENT_ID_RE.test(s.oauth_client_id)) problems.push("The OAuth client ID has unexpected characters");
-		if (s.price_per_user_cents === null) problems.push(`Price per user "${text("price_per_user")}" isn't an amount like 6.00`);
-		if (s.base_fee_cents === null) problems.push(`Flat fee "${text("base_fee")}" isn't an amount like 0.00`);
-		return s;
+	const getSettings = async () => (await inMain(() => ctx.db.query(
+		`SELECT socket_path, serve_target, serve_port, serve_http, serve_wanted FROM ${S}.settings WHERE id`))).rows[0];
+
+	// Before 0.6.0 the module also read the Tailscale API (devices, users,
+	// billing). Once per organization: drop the API credentials and options
+	// from Ledger's settings store (set() keeps only the manifest's fields, and
+	// there are none now) and the dashboard items those features posted.
+	async function forgetApiFeatures() {
+		const { rows: [row] } = await ctx.db.query(`SELECT api_features_removed FROM ${S}.settings WHERE id`);
+		if (!row || row.api_features_removed) return;
+		await ctx.settings?.set({});
+		for (const key of OLD_NOTIFICATIONS) await safe(() => ctx.dashboard.remove(key, "notification"));
+		const todos = (await safe(() => ctx.dashboard.list({ kind: "todo" }))) ?? [];
+		for (const t of todos) if (String(t.key).startsWith("charge-")) await safe(() => ctx.dashboard.remove(t.key));
+		await ctx.db.query(`UPDATE ${S}.settings SET api_features_removed = true WHERE id`);
+		ctx.log.info("tailscale: removed the Tailscale API settings and dashboard items");
 	}
-
-	const isConfigured = (s) =>
-		s.auth_mode === "api_key" ? !!s.api_key : !!(s.oauth_client_id && s.oauth_client_secret);
-
-	// The two accounts a charge posts to, with the setting that holds each.
-	const BILLING_ACCOUNTS = [
-		{ role: "expense", setting: "expense_account", types: ["expense"], label: "Expense" },
-		{ role: "payment", setting: "payment_account", types: ["asset", "liability"], label: "Payment" },
-	];
-
-	// Each billing account's code and what's wrong with it (null when it's fine).
-	async function billingAccounts(s) {
-		const out = {};
-		for (const a of BILLING_ACCOUNTS) {
-			const code = s[a.setting];
-			let problem = null;
-			if (!code) problem = `Set the ${a.label.toLowerCase()} account`;
-			else if (!CODE_RE.test(code)) problem = `${a.label} account "${code.slice(0, 40)}" isn't an account code`;
-			else await checkAccount(code, s.currency, a.types, a.label).catch((e) => (problem = e.message));
-			out[a.role] = { code, problem };
-		}
-		return out;
-	}
-
-	// Why billing can't post right now, or [] when it can.
-	async function billingProblems(s, accounts) {
-		if (!s.billing_enabled) return [];
-		const out = [];
-		if (s.price_per_user_cents === null || s.base_fee_cents === null) out.push("Fix the prices");
-		for (const a of Object.values(accounts ?? await billingAccounts(s))) if (a.problem) out.push(a.problem);
-		if (s.expense_account && s.expense_account === s.payment_account) out.push("Expense and payment accounts must differ");
-		return out;
-	}
-
-	async function checkAccount(code, currency, types, label) {
-		const a = await ctx.ledger.getAccount(code).catch(() => null);
-		if (!a) throw bad(`${label} account ${code} does not exist`);
-		if (!a.is_active) throw bad(`${label} account ${code} is inactive`);
-		if (a.currency !== currency) throw bad(`${label} account ${code} is in ${a.currency}, not ${currency}`);
-		if (!types.includes(a.type)) throw bad(`${label} account ${code} must be of type ${types.join(" or ")}`);
-		return a;
-	}
-
-	// Before 0.1.0 the module kept its configuration in its own table; copy it
-	// into Ledger's settings form once, then forget the secrets kept there.
-	async function moveOldSettings() {
-		const { rows: [old] } = await ctx.db.query(`SELECT * FROM ${S}.settings WHERE id AND NOT moved_to_ledger_settings`);
-		if (!old) return;
-		const hadCredentials = !!(old.api_key || old.oauth_client_id || old.oauth_client_secret);
-		const values = {
-			tailnet: old.tailnet,
-			auth_mode: hadCredentials ? old.auth_mode : undefined,
-			api_key: old.api_key ?? undefined,
-			oauth_client_id: old.oauth_client_id ?? undefined,
-			oauth_client_secret: old.oauth_client_secret ?? undefined,
-			sync_minutes: old.sync_minutes,
-			key_expiry_warn_days: old.key_expiry_warn_days,
-			offline_warn_days: old.offline_warn_days,
-			billing_enabled: old.billing_enabled,
-			price_per_user: centsToText(old.price_per_user_cents),
-			base_fee: centsToText(old.base_fee_cents),
-			currency: old.currency,
-			expense_account: old.expense_account ?? undefined,
-			payment_account: old.payment_account ?? undefined,
-			bill_day: old.bill_day,
-		};
-		// Only what someone set: the old table's defaults would overwrite the form's values.
-		const oldDefaults = {
-			tailnet: "-", sync_minutes: 60, key_expiry_warn_days: 14, offline_warn_days: 30, billing_enabled: false,
-			price_per_user: "6.00", base_fee: "0.00", currency: "USD", bill_day: 1,
-		};
-		for (const k of Object.keys(values)) if (values[k] === undefined || values[k] === oldDefaults[k]) delete values[k];
-		// And never over what the form already holds: a restored old backup (Ledger 0.14)
-		// brings this table back unmoved while the form keeps today's values.
-		const form = await ctx.settings.get();
-		const formHas = (k) => form[k] !== null && form[k] !== undefined && form[k] !== "" && form[k] !== FORM_DEFAULTS[k];
-		const formHasCredentials = CREDENTIAL_KEYS.filter((k) => k !== "auth_mode").some(formHas);
-		for (const k of Object.keys(values)) {
-			if (CREDENTIAL_KEYS.includes(k) ? formHasCredentials : formHas(k)) delete values[k];
-		}
-		if (Object.keys(values).length) await ctx.settings.set(values);
-		await ctx.db.query(
-			`UPDATE ${S}.settings SET moved_to_ledger_settings = true, api_key = NULL, oauth_client_secret = NULL WHERE id`);
-		ctx.log.info("tailscale settings moved to Ledger's settings form", { moved: Object.keys(values).filter((k) => !k.includes("secret") && k !== "api_key") });
-	}
-	try {
-		await moveOldSettings();
-	} catch (e) {
-		ctx.log.error("could not move tailscale settings; will retry at next start", { error: String(e?.message ?? e) });
-	}
-
-	// Saving the form (this runs inside the organization that saved it): use new
-	// credentials right away, and recheck billing there.
-	ctx.settings.onChange(async () => {
-		oauthTokens.clear();
-		try {
-			const s = await getSettings();
-			if (isConfigured(s)) await sync("settings").catch(() => {}); // failure is shown on the dashboard
-			await checkBillingHere(s);
-		} catch (e) {
-			ctx.log.warn("tailscale settings change follow-up failed", { error: String(e?.message ?? e) });
-		}
-	});
-
-	// ---------------------------------------------------------------- Tailscale API
-
-	async function authorization(s) {
-		if (s.auth_mode === "api_key") {
-			if (!s.api_key) throw new ctx.HttpError(409, `Add a Tailscale API access token under ${SETTINGS_LINK}`);
-			return `Bearer ${s.api_key}`;
-		}
-		if (!s.oauth_client_id || !s.oauth_client_secret) {
-			throw new ctx.HttpError(409, `Add the Tailscale OAuth client ID and secret under ${SETTINGS_LINK}`);
-		}
-		const cached = oauthTokens.get(s.oauth_client_id);
-		if (cached && cached.exp > Date.now() + 60_000) return `Bearer ${cached.value}`;
-		const r = await fetch(`${API}/oauth/token`, {
-			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-			body: new URLSearchParams({
-				client_id: s.oauth_client_id, client_secret: s.oauth_client_secret, grant_type: "client_credentials",
-			}),
-			signal: AbortSignal.timeout(TIMEOUT_MS),
-		});
-		if (!r.ok) throw new Error(`Tailscale rejected the OAuth client (HTTP ${r.status})`);
-		const j = await r.json();
-		if (typeof j.access_token !== "string") throw new Error("Tailscale OAuth response had no access_token");
-		oauthTokens.set(s.oauth_client_id, { value: j.access_token, exp: Date.now() + (Number(j.expires_in) || 3600) * 1000 });
-		return `Bearer ${j.access_token}`;
-	}
-
-	async function tsGet(s, path) {
-		const r = await fetch(`${API}/tailnet/${encodeURIComponent(s.tailnet)}${path}`, {
-			headers: { Authorization: await authorization(s), Accept: "application/json" },
-			signal: AbortSignal.timeout(TIMEOUT_MS),
-		});
-		if (!r.ok) {
-			const detail = await r.json().then((j) => j?.message).catch(() => null);
-			const err = new Error(`Tailscale ${path.split("?")[0]}: HTTP ${r.status}${detail ? ` – ${String(detail).slice(0, 200)}` : ""}`);
-			err.status = r.status;
-			throw err;
-		}
-		return r.json();
-	}
-
-	const toDevice = (d) => ({
-		id: str(d.nodeId || d.id),
-		name: str(d.name || d.hostname || d.nodeId || d.id),
-		hostname: str(d.hostname),
-		os: str(d.os),
-		user_login: str(d.user),
-		addresses: strList(d.addresses),
-		client_version: str(d.clientVersion),
-		update_available: d.updateAvailable === true,
-		authorized: d.authorized !== false,
-		is_external: d.isExternal === true,
-		tags: strList(d.tags),
-		created: ts(d.created),
-		last_seen: ts(d.lastSeen),
-		expires: d.keyExpiryDisabled ? null : ts(d.expires),
-		key_expiry_disabled: d.keyExpiryDisabled === true,
-		connected: typeof d.connectedToControl === "boolean" ? d.connectedToControl : null,
-	});
-
-	const toUser = (u) => ({
-		id: str(u.id),
-		login_name: str(u.loginName),
-		display_name: str(u.displayName),
-		type: str(u.type),
-		role: str(u.role),
-		status: str(u.status),
-		device_count: Number.isSafeInteger(u.deviceCount) ? u.deviceCount : null,
-		last_seen: ts(u.lastSeen),
-		connected: typeof u.currentlyConnected === "boolean" ? u.currentlyConnected : null,
-		created: ts(u.created),
-	});
-
-	// Replace a snapshot table with `rows` in one atomic statement.
-	async function replaceSnapshot(table, cols, rows) {
-		const names = Object.keys(cols);
-		const t = `${S}.${table}`;
-		const unique = [...new Map(rows.filter((r) => r.id).map((r) => [r.id, r])).values()];
-		const sql = `
-			WITH src AS (
-				SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(${names.map((n) => `${n} ${cols[n]}`).join(", ")})
-			), gone AS (
-				DELETE FROM ${t} o WHERE NOT EXISTS (SELECT 1 FROM src WHERE src.id = o.id)
-			), up AS (
-				INSERT INTO ${t} (${names.join(", ")}, synced_at)
-				SELECT ${names.join(", ")}, now() FROM src
-				ON CONFLICT (id) DO UPDATE SET
-					${names.filter((n) => n !== "id").map((n) => `${n} = EXCLUDED.${n}`).join(", ")},
-					synced_at = EXCLUDED.synced_at
-				RETURNING 1
-			)
-			SELECT count(*)::int AS n FROM up`;
-		return (await ctx.db.query(sql, [JSON.stringify(unique)])).rows[0].n;
-	}
-
-	// ---------------------------------------------------------------- sync
-
-	// Sync the current organization (the request's, or the one eachOrg visits).
-	async function sync(triggeredBy) {
-		const org = await currentOrgId();
-		if (!running.has(org)) running.set(org, doSync(triggeredBy).finally(() => running.delete(org)));
-		return running.get(org);
-	}
-
-	async function doSync(triggeredBy) {
-		const s = await getSettings();
-		if (!isConfigured(s)) throw new ctx.HttpError(409, `Add Tailscale API credentials under ${SETTINGS_LINK}`);
-		let devices = null, users = null, warning = null, failure = null;
-		try {
-			const dj = await tsGet(s, "/devices?fields=all");
-			if (!Array.isArray(dj?.devices)) throw new Error("Unexpected response from Tailscale /devices");
-			devices = dj.devices.map(toDevice);
-			// The users endpoint needs an extra scope; devices alone are still useful.
-			try {
-				const uj = await tsGet(s, "/users");
-				if (!Array.isArray(uj?.users)) throw new Error("Unexpected response from Tailscale /users");
-				users = uj.users.map(toUser);
-			} catch (e) {
-				warning = `Users not synced: ${e.message}`;
-			}
-		} catch (e) {
-			failure = e;
-		}
-		const message = failure && String(failure?.message ?? failure).slice(0, 500);
-		if (failure) ctx.log.warn("tailscale sync failed", { error: message });
-		else ctx.log.info("tailscale sync ok", { devices: devices.length, users: users?.length ?? null, warning });
-		const done = await recordSync(s, triggeredBy, { devices, users, warning, message });
-		if (failure) throw failure instanceof ctx.HttpError ? failure : new ctx.HttpError(502, message);
-		return done;
-	}
-
-	// The result of a sync: snapshot tables, sync history and dashboard.
-	async function recordSync(s, triggeredBy, { devices, users, warning, message }) {
-		const { rows: [run] } = await ctx.db.query(
-			`INSERT INTO ${S}.syncs (triggered_by) VALUES ($1) RETURNING id`, [triggeredBy]);
-		if (message) {
-			await ctx.db.query(
-				`UPDATE ${S}.syncs SET finished_at = now(), ok = false, error = $2 WHERE id = $1`, [run.id, message]);
-			await safe(() => ctx.dashboard.notify({
-				key: "sync-error", title: "Tailscale sync failed", body: message, level: "danger", link: LINK,
-			}));
-			return null;
-		}
-		const deviceCount = await replaceSnapshot("devices", DEVICE_COLS, devices);
-		const userCount = users ? await replaceSnapshot("users", USER_COLS, users) : null;
-		const { rows: [done] } = await ctx.db.query(
-			`UPDATE ${S}.syncs SET finished_at = now(), ok = true, warning = $2, device_count = $3, user_count = $4
-			 WHERE id = $1 RETURNING *`, [run.id, warning, deviceCount, userCount]);
-		await ctx.db.query(`DELETE FROM ${S}.syncs WHERE id < (SELECT max(id) - 200 FROM ${S}.syncs)`);
-		await safe(() => ctx.dashboard.remove("sync-error", "notification"));
-		await raiseAlerts(s);
-		return done;
-	}
-
-	// Post or clear one dashboard notification per kind of problem.
-	async function alert(key, names, title, level) {
-		if (!names.length) return safe(() => ctx.dashboard.remove(key, "notification"));
-		return safe(() => ctx.dashboard.notify({ key, title, body: listNames(names), level, link: LINK }));
-	}
-
-	async function raiseAlerts(s) {
-		const q = async (sql, p = []) => (await ctx.db.query(sql, p)).rows.map((r) => shortName(r.name));
-		const expiring = await q(
-			`SELECT name FROM ${S}.devices WHERE expires IS NOT NULL AND expires < now() + make_interval(days => $1)
-			 ORDER BY expires`, [s.key_expiry_warn_days]);
-		await alert("key-expiry", expiring,
-			`${expiring.length} Tailscale device key${expiring.length === 1 ? "" : "s"} expire${expiring.length === 1 ? "s" : ""} within ${s.key_expiry_warn_days} days`,
-			"warning");
-
-		const offline = s.offline_warn_days > 0 ? await q(
-			`SELECT name FROM ${S}.devices WHERE NOT is_external AND connected IS NOT TRUE
-			   AND last_seen < now() - make_interval(days => $1) ORDER BY last_seen`, [s.offline_warn_days]) : [];
-		await alert("offline", offline,
-			`${offline.length} Tailscale device${offline.length === 1 ? "" : "s"} offline for over ${s.offline_warn_days} days`, "info");
-
-		const updates = await q(`SELECT name FROM ${S}.devices WHERE update_available AND NOT is_external ORDER BY name`);
-		await alert("updates", updates,
-			`Tailscale update available on ${updates.length} device${updates.length === 1 ? "" : "s"}`, "info");
-
-		const pending = [
-			...(await q(`SELECT name FROM ${S}.devices WHERE NOT authorized ORDER BY name`)),
-			...(await ctx.db.query(`SELECT coalesce(login_name, display_name, id) AS n FROM ${S}.users
-				WHERE status = 'needs-approval' ORDER BY 1`)).rows.map((r) => r.n),
-		];
-		await alert("approval", pending,
-			`${pending.length} Tailscale device${pending.length === 1 ? "" : "s"}/user${pending.length === 1 ? "" : "s"} awaiting approval`,
-			"warning");
-	}
-
-	// ---------------------------------------------------------------- billing
-
-	const billableSeats = async () =>
-		(await ctx.db.query(
-			`SELECT count(*) FILTER (WHERE type = 'member' AND status = 'active')::int AS seats, count(*)::int AS users
-			 FROM ${S}.users`)).rows[0];
-
-	// Put a "record this month's charge" to-do on the dashboard once bill_day has
-	// passed, if billing is on and set up in this organization.
-	async function checkBillingHere(s) {
-		if (s.billing_enabled && !(await billingProblems(s)).length) await billingReminder(s);
-	}
-
-	async function billingReminder(s) {
-		const now = new Date();
-		const period = localDate(now).slice(0, 7);
-		const key = `charge-${period}`;
-		const { rowCount } = await ctx.db.query(
-			`SELECT 1 FROM ${S}.charges WHERE period = $1 AND status <> 'reversed'`, [period]);
-		if (rowCount) return safe(() => ctx.dashboard.complete(key));
-		if (now.getDate() < s.bill_day) return;
-		const items = (await safe(() => ctx.dashboard.list({ kind: "todo" }))) ?? [];
-		if (items.some((i) => i.key === key)) return;
-		await safe(() => ctx.dashboard.todo({
-			key, title: `Record Tailscale charge for ${period}`,
-			body: "Post this month's Tailscale subscription from the Billing tab.",
-			due: `${period}-${pad(s.bill_day)}`, link: LINK,
-		}));
-	}
-
-	// Journal entries link back to their charge (Ledger 0.11.2): Ledger shows the
-	// link on the entry, and linkedEntries() says which entries a charge has.
-	const chargeRef = (c) => `charge:${c.id}`;
-	const chargeLink = (c, reversal = false) => ({
-		ref: chargeRef(c),
-		label: `${reversal ? "Reversal of " : ""}Tailscale ${c.period} · ${c.seats} user${c.seats === 1 ? "" : "s"}`,
-		href: LINK,
-	});
-
-	// A charge left 'pending' (Ledger stopped while posting it): its entry, if it
-	// was posted, carries the charge's link, so mark it posted.
-	async function settlePending() {
-		const { rows } = await ctx.db.query(
-			`SELECT * FROM ${S}.charges WHERE status = 'pending' AND created_at < now() - interval '1 minute'`);
-		for (const c of rows) {
-			const [linked] = await ctx.ledger.linkedEntries(chargeRef(c));
-			if (!linked) continue;
-			await ctx.db.query(`UPDATE ${S}.charges SET status = 'posted', entry_id = $2 WHERE id = $1 AND status = 'pending'`,
-				[c.id, linked.entry_id]);
-			ctx.log.info("tailscale pending charge found posted", { period: c.period, entry_id: linked.entry_id });
-		}
-	}
-
-	// Charges posted before 0.3.0 have no links yet: add them once.
-	async function linkOldCharges() {
-		const have = new Set((await ctx.ledger.linkedEntries()).map((l) => `${l.ref}#${l.entry_id}`));
-		const { rows } = await ctx.db.query(
-			`SELECT * FROM ${S}.charges WHERE status IN ('posted', 'reversing', 'reversed') AND entry_id IS NOT NULL`);
-		for (const c of rows) {
-			for (const [entryId, reversal] of [[c.entry_id, false], [c.reversal_entry_id, true]]) {
-				if (entryId == null || have.has(`${chargeRef(c)}#${entryId}`)) continue;
-				await ctx.ledger.linkJournalEntry(entryId, chargeLink(c, reversal))
-					.catch((e) => ctx.log.warn("could not link an old Tailscale charge", { period: c.period, error: e.message }));
-			}
-		}
-	}
-
-	// Tailscale in Ledger's shared vendor list (Ledger 0.16), so its charges show who
-	// they're with. Older Ledgers, or a vendor someone made inactive: post without one.
-	async function tailscaleVendor() {
-		if (!ctx.entities?.ensure) return null;
-		try {
-			const v = await ctx.entities.ensure(VENDOR_NAME, "vendor");
-			return v?.is_active === false ? null : v;
-		} catch (e) {
-			ctx.log.warn("could not find or add the Tailscale vendor", { error: String(e?.message ?? e) });
-			return null;
-		}
-	}
-
-	function intField(v, name, min, max) {
-		const n = (typeof v === "string" && /^\d+$/.test(v.trim())) || typeof v === "bigint" ? Number(v) : v;
-		if (!Number.isSafeInteger(n) || n < min || n > max) throw bad(`${name} must be a whole number from ${min} to ${max}`);
-		return n;
-	}
-
-	// ---------------------------------------------------------------- routes
-
-	ctx.route("GET", "/status", async (req) => {
-		const s = await getSettings();
-		const { rows: [counts] } = await ctx.db.query(`
-			SELECT count(*)::int AS devices,
-			       count(*) FILTER (WHERE connected)::int AS online,
-			       count(*) FILTER (WHERE expires < now() + make_interval(days => $1))::int AS expiring,
-			       count(*) FILTER (WHERE update_available AND NOT is_external)::int AS updates,
-			       count(*) FILTER (WHERE NOT authorized)::int AS unauthorized
-			FROM ${S}.devices`, [s.key_expiry_warn_days]);
-		const { rows: [lastSync] } = await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 1`);
-		const period = localDate().slice(0, 7);
-		const { rows: [charge] } = await ctx.db.query(
-			`SELECT * FROM ${S}.charges WHERE period = $1 AND status <> 'reversed'`, [period]);
-		return {
-			role: req.user.role,
-			configured: isConfigured(s),
-			syncing: running.has(await currentOrgId()),
-			// No secrets: only whether they're set.
-			settings: {
-				tailnet: s.tailnet, auth_mode: s.auth_mode, sync_minutes: s.sync_minutes,
-				key_expiry_warn_days: s.key_expiry_warn_days, offline_warn_days: s.offline_warn_days,
-				billing_enabled: s.billing_enabled, price_per_user_cents: s.price_per_user_cents, base_fee_cents: s.base_fee_cents,
-				currency: s.currency, expense_account: s.expense_account, payment_account: s.payment_account, bill_day: s.bill_day,
-			},
-			problems: s.problems,
-			...(await (async () => {
-				const accounts = s.billing_enabled ? await billingAccounts(s) : null;
-				return { billing_accounts: accounts, billing_problems: await billingProblems(s, accounts) };
-			})()),
-			last_sync: lastSync ?? null,
-			counts: { ...counts, ...(await billableSeats()) },
-			period,
-			today: localDate(),
-			period_charge: charge ?? null,
-		};
-	});
-
-	ctx.route("POST", "/sync", async (req) => sync(req.user.username));
-
-	ctx.route("GET", "/devices", async () =>
-		(await ctx.db.query(`SELECT * FROM ${S}.devices ORDER BY lower(name)`)).rows);
-
-	ctx.route("GET", "/users", async () =>
-		(await ctx.db.query(`SELECT * FROM ${S}.users ORDER BY lower(coalesce(display_name, login_name, id))`)).rows);
-
-	ctx.route("GET", "/syncs", async () =>
-		(await ctx.db.query(`SELECT * FROM ${S}.syncs ORDER BY id DESC LIMIT 20`)).rows);
-
-	// Use an account for billing, e.g. one just made with Ledger's "+ New account…"
-	// dialog: saved into this organization's settings form (admins only, like the form).
-	ctx.route("PUT", "/billing/accounts", async (req) => {
-		if (req.user.role !== "admin") throw new ctx.HttpError(403, "Only an admin can change the billing accounts");
-		const b = req.body;
-		if (!b || typeof b !== "object" || Array.isArray(b)) throw bad("Send {expense_account?, payment_account?}");
-		const s = await getSettings();
-		const values = {};
-		for (const a of BILLING_ACCOUNTS) {
-			const code = b[a.setting];
-			if (code === undefined) continue;
-			if (typeof code !== "string" || !CODE_RE.test(code)) throw bad(`${a.setting} must be an account code`);
-			await checkAccount(code, s.currency, a.types, a.label);
-			values[a.setting] = code;
-		}
-		if (!Object.keys(values).length) throw bad("Send expense_account or payment_account");
-		if ((values.expense_account ?? s.expense_account) === (values.payment_account ?? s.payment_account)) {
-			throw bad("Expense and payment accounts must differ");
-		}
-		await ctx.settings.set(values);
-		ctx.log.info("tailscale billing accounts set", { ...values, by: req.user.username });
-		const next = await getSettings();
-		return { billing_accounts: await billingAccounts(next), billing_problems: await billingProblems(next) };
-	});
-
-	ctx.route("GET", "/charges", async () => {
-		await settlePending();
-		return (await ctx.db.query(`SELECT * FROM ${S}.charges ORDER BY period DESC, id DESC LIMIT 120`)).rows;
-	});
-
-	ctx.route("POST", "/charges", async (req) => {
-		const b = req.body ?? {};
-		const s = await getSettings();
-		if (!s.billing_enabled) throw new ctx.HttpError(409, `Turn billing on under ${SETTINGS_LINK}`);
-		const problems = await billingProblems(s);
-		if (problems.length) throw new ctx.HttpError(409, `${problems.join("; ")} under ${SETTINGS_LINK}`);
-
-		const period = b.period ?? localDate().slice(0, 7);
-		if (typeof period !== "string" || !PERIOD_RE.test(period)) throw bad("period must be YYYY-MM");
-		const entry_date = b.entry_date ?? localDate();
-		if (typeof entry_date !== "string" || !isRealDate(entry_date)) throw bad("entry_date must be a valid YYYY-MM-DD date");
-		let seats;
-		if (b.seats === undefined || b.seats === null || b.seats === "") {
-			const c = await billableSeats();
-			if (!c.users) throw bad("No user data yet: sync with Tailscale or enter the number of seats");
-			seats = c.seats;
-		} else {
-			seats = intField(b.seats, "seats", 0, 100_000);
-		}
-		const memo = b.memo == null || b.memo === "" ? null : b.memo;
-		if (memo !== null && (typeof memo !== "string" || memo.trim().length > 200)) throw bad("memo must be text up to 200 characters");
-
-		const total = BigInt(seats) * BigInt(s.price_per_user_cents) + BigInt(s.base_fee_cents);
-		if (total <= 0n) throw bad("The charge comes to 0.00; nothing to post");
-
-		// Reserve the month first so two clicks can't post twice.
-		let charge;
-		try {
-			({ rows: [charge] } = await ctx.db.query(
-				`INSERT INTO ${S}.charges (period, entry_date, seats, unit_price_cents, base_fee_cents, total_cents,
-					currency, expense_account, payment_account, memo, created_by)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-				[period, entry_date, seats, s.price_per_user_cents, s.base_fee_cents, total, s.currency,
-					s.expense_account, s.payment_account, memo?.trim() ?? null, req.user.username]));
-		} catch (e) {
-			if (e?.code === "23505") throw new ctx.HttpError(409, `A Tailscale charge for ${period} is already recorded`);
-			throw e;
-		}
-
-		let entry;
-		try {
-			const vendor = await tailscaleVendor();
-			const lineMemo = `${seats} user${seats === 1 ? "" : "s"}`;
-			entry = await ctx.ledger.createJournalEntry({
-				entry_date,
-				description: `Tailscale subscription ${period}`,
-				reference: `tailscale:${period}`,
-				lines: [
-					{ account_code: s.expense_account, debit_cents: total, memo: memo?.trim() || lineMemo },
-					{ account_code: s.payment_account, credit_cents: total, memo: lineMemo },
-				],
-				links: [chargeLink(charge)],
-				...(vendor ? { entity_id: vendor.id } : {}),
-			}, req.user);
-		} catch (e) {
-			await ctx.db.query(`DELETE FROM ${S}.charges WHERE id = $1 AND status = 'pending'`, [charge.id]);
-			throw e;
-		}
-		const { rows: [posted] } = await ctx.db.query(
-			`UPDATE ${S}.charges SET status = 'posted', entry_id = $2 WHERE id = $1 RETURNING *`, [charge.id, entry.id]);
-		ctx.log.info("tailscale charge posted", { period, entry_id: entry.id, by: req.user.username });
-		await safe(() => ctx.dashboard.complete(`charge-${period}`));
-		return ctx.response(201, posted);
-	});
-
-	ctx.route("POST", "/charges/:id/reverse", async (req) => {
-		if (!/^\d{1,18}$/.test(req.params.id)) throw new ctx.HttpError(404, "Charge not found");
-		const { rows: [c] } = await ctx.db.query(
-			`UPDATE ${S}.charges SET status = 'reversing' WHERE id = $1 AND status = 'posted' RETURNING *`, [req.params.id]);
-		if (!c) throw new ctx.HttpError(409, "Only a posted charge can be reversed");
-		let rev;
-		try {
-			rev = await ctx.ledger.reverseJournalEntry(c.entry_id, {
-				entry_date: localDate(), description: `Reverse Tailscale subscription ${c.period}`,
-			}, req.user);
-		} catch (e) {
-			await ctx.db.query(`UPDATE ${S}.charges SET status = 'posted' WHERE id = $1`, [c.id]);
-			throw e;
-		}
-		await ctx.ledger.linkJournalEntry(rev.id, chargeLink(c, true), req.user)
-			.catch((e) => ctx.log.warn("could not link the reversing entry", { period: c.period, error: e.message }));
-		const { rows: [done] } = await ctx.db.query(
-			`UPDATE ${S}.charges SET status = 'reversed', reversal_entry_id = $2 WHERE id = $1 RETURNING *`, [c.id, rev.id]);
-		ctx.log.info("tailscale charge reversed", { period: c.period, entry_id: rev.id, by: req.user.username });
-		await getSettings().then(checkBillingHere).catch((e) => ctx.log.warn("billing check failed", { error: e.message }));
-		return done;
-	});
-
-	// A charge stuck in 'pending' whose entry never got posted (no linked entry) can go.
-	ctx.route("DELETE", "/charges/:id", async (req) => {
-		if (!/^\d{1,18}$/.test(req.params.id)) throw new ctx.HttpError(404, "Charge not found");
-		await settlePending();
-		if ((await ctx.ledger.linkedEntries(`charge:${req.params.id}`)).length) {
-			throw new ctx.HttpError(409, "This charge has a journal entry; reverse it instead");
-		}
-		const { rowCount } = await ctx.db.query(
-			`DELETE FROM ${S}.charges WHERE id = $1 AND status = 'pending' AND created_at < now() - interval '1 minute'`,
-			[req.params.id]);
-		if (!rowCount) throw new ctx.HttpError(409, "Only a charge stuck in 'pending' for over a minute can be discarded");
-	});
-
-	// Devices and users in Ledger's search bar.
-	ctx.search?.provide(async (query, { limit }) => {
-		const q = String(query).trim();
-		if (q.length < 2) return [];
-		const like = `%${q.replace(/[\\%_]/g, (c) => "\\" + c)}%`;
-		const { rows: devices } = await ctx.db.query(
-			`SELECT name, os, user_login, addresses->>0 AS ip, connected, last_seen FROM ${S}.devices
-			  WHERE name ILIKE $1 OR hostname ILIKE $1 OR user_login ILIKE $1 OR addresses::text ILIKE $1 OR tags::text ILIKE $1
-			  ORDER BY lower(name) LIMIT $2`, [like, limit]);
-		const { rows: users } = await ctx.db.query(
-			`SELECT login_name, display_name, status, device_count FROM ${S}.users
-			  WHERE login_name ILIKE $1 OR display_name ILIKE $1 ORDER BY lower(coalesce(display_name, login_name)) LIMIT $2`,
-			[like, limit]);
-		return [
-			...devices.map((d) => ({
-				title: shortName(d.name),
-				subtitle: ["Tailscale device", d.ip, d.os, d.user_login, d.connected ? "online" : null].filter(Boolean).join(" · "),
-				href: LINK,
-			})),
-			...users.map((u) => ({
-				title: u.display_name || u.login_name,
-				subtitle: ["Tailscale user", u.login_name, u.status, u.device_count != null ? `${u.device_count} device${u.device_count === 1 ? "" : "s"}` : null]
-					.filter(Boolean).join(" · "),
-				href: LINK,
-			})),
-		].slice(0, limit);
-	});
 
 	// ---------------------------------------------------------------- tailnet access (local tailscaled)
 
@@ -923,7 +261,9 @@ export default async function register(ctx) {
 		await eachOrg("tailnet access check", () => clearOrNotifyServe(null));
 	}
 
-	ctx.route("GET", "/node", async (req) => ({ ...(await nodeInfo(await getSettings())), can_manage: await canManageServe(req) }));
+	ctx.route("GET", "/node", async (req) => ({
+		...(await nodeInfo(await getSettings())), role: req.user.role, can_manage: await canManageServe(req),
+	}));
 
 	ctx.route("PUT", "/node/settings", async (req) => {
 		await requireServeAdmin(req, "change how Ledger is shared on the tailnet");
@@ -992,30 +332,14 @@ export default async function register(ctx) {
 
 	// ---------------------------------------------------------------- background
 
-	// Every minute: sync each organization that's due, remind about billing
-	// (hourly), and check that Ledger is still shared if it should be.
+	// Every minute: if Ledger should be shared, check that it still is.
 	async function tick() {
-		const billingDue = Date.now() - lastBillingCheck > 3_600_000;
-		if (billingDue) lastBillingCheck = Date.now();
-		await eachOrg("background check", async (org) => {
-			const s = await getSettings();
-			if (isConfigured(s) && s.sync_minutes > 0 && !running.has(org.id)) {
-				const { rows: [due] } = await ctx.db.query(
-					`SELECT coalesce(max(started_at) < now() - make_interval(mins => $1), true) AS due FROM ${S}.syncs`,
-					[s.sync_minutes]);
-				if (due.due) await sync("auto").catch(() => {}); // failure is logged and shown on the dashboard
-			}
-			if (billingDue) await checkBillingHere(s);
-		});
 		if ((await getSettings()).serve_wanted) await checkServe();
 	}
 	function runTick() {
 		tick().catch((e) => ctx.log.error("tailscale background check failed", { error: e.message }));
 	}
+	setTimeout(() => eachOrg("removing old Tailscale API data", forgetApiFeatures), 3_000).unref();
 	setTimeout(runTick, 5_000).unref();
-	setTimeout(() => eachOrg("linking old charges", async () => {
-		await settlePending();
-		await linkOldCharges();
-	}), 8_000).unref();
 	setInterval(runTick, 60_000).unref();
 }
